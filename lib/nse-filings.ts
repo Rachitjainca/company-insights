@@ -87,11 +87,10 @@ async function getNSECookie(): Promise<string> {
       },
       redirect: "follow",
     });
-    // getSetCookie() is available in Node 18+ / undici
+    // getSetCookie() is available in Node 18+ / undici; use unknown cast to avoid TS overlap error
+    const hdrs = res.headers as unknown as { getSetCookie?(): string[] };
     const setCookieHeaders: string[] =
-      typeof (res.headers as Record<string, unknown>).getSetCookie === "function"
-        ? (res.headers as unknown as { getSetCookie(): string[] }).getSetCookie()
-        : [];
+      typeof hdrs.getSetCookie === "function" ? hdrs.getSetCookie() : [];
     const cookiePairs = setCookieHeaders.map((c) => c.split(";")[0].trim());
     const cookie = cookiePairs.filter(Boolean).join("; ");
     nseSession = { cookie, ts: Date.now() };
