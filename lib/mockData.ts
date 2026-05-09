@@ -8,6 +8,12 @@ import {
 
 // Mock data service - in production, this would fetch from actual APIs
 export const mockCompanyData: Record<string, CompanyData> = {
+  PAYTM: {
+    ticker: "PAYTM",
+    name: "One 97 Communications (Paytm)",
+    sector: "Fintech",
+    marketCap: "—",
+  },
   TCS: {
     ticker: "TCS",
     name: "Tata Consultancy Services",
@@ -140,19 +146,26 @@ export const mockTranscripts: ConcallTranscript[] = [
 ];
 
 export async function fetchCompanyInsights(
-  ticker: string
+  ticker: string,
+  nameHint?: string
 ): Promise<CompanyInsights | null> {
-  const company = mockCompanyData[ticker];
+  const known = mockCompanyData[ticker.toUpperCase()];
 
-  if (!company) {
-    return null;
-  }
+  // For any NSE stock, return a placeholder shell so the documents
+  // panel (real IR scraper) can still render. If we have pre-built
+  // financial mock data for this ticker, include it.
+  const company: CompanyData = known ?? {
+    ticker: ticker.toUpperCase(),
+    name: nameHint ?? ticker.toUpperCase(),
+    sector: "—",
+    marketCap: "—",
+  };
 
   return {
     company,
-    financialResults: mockFinancialResults,
-    presentations: mockPresentations,
-    transcripts: mockTranscripts,
+    financialResults: known ? mockFinancialResults : [],
+    presentations: known ? mockPresentations : [],
+    transcripts: known ? mockTranscripts : [],
   };
 }
 

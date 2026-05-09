@@ -100,87 +100,72 @@ export default function ExportButton({ insights }: ExportButtonProps) {
   };
 
   return (
-    <div className="bg-white rounded-lg shadow p-6 space-y-4">
-      <h3 className="text-lg font-semibold mb-4">Export Data</h3>
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6">
+      <h3 className="font-semibold text-gray-900 mb-4">Export Data</h3>
 
-      <div className="space-y-3">
+      <div className="flex flex-col sm:flex-row gap-3">
         <button
           onClick={handleExportToSheets}
           disabled={loading}
-          className="w-full px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-blue-400 disabled:cursor-not-allowed font-medium transition flex items-center justify-center gap-2"
+          className="flex-1 inline-flex items-center justify-center gap-2 px-5 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed font-semibold text-sm transition-colors"
         >
           {loading ? (
             <>
-              <span className="animate-spin">⚙️</span>
-              {isAuthenticated ? "Creating Sheet..." : "Authorizing..."}
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+              </svg>
+              {isAuthenticated ? "Creating Sheet…" : "Authorising…"}
             </>
+          ) : isAuthenticated ? (
+            <>📊 Export to Google Sheets</>
           ) : (
-            <>
-              {isAuthenticated ? "📊 Export to Google Sheets" : "🔑 Authorize Google Sheets"}
-            </>
+            <>🔑 Connect Google Sheets</>
           )}
         </button>
 
         <button
           onClick={handleDownloadCSV}
-          disabled={loading}
-          className="w-full px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:bg-green-400 disabled:cursor-not-allowed font-medium transition"
+          disabled={loading || insights.financialResults.length === 0}
+          className="flex-1 inline-flex items-center justify-center gap-2 px-5 py-3 bg-gray-100 text-gray-800 rounded-xl hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed font-semibold text-sm transition-colors"
         >
-          📥 Download as CSV
+          📥 Download CSV
         </button>
       </div>
 
       {message && (
         <div
-          className={`p-4 rounded text-sm font-medium transition-all ${
+          className={`mt-4 flex items-center justify-between gap-3 px-4 py-3 rounded-xl text-sm font-medium ${
             showSuccessMessage
               ? "bg-green-50 text-green-800 border border-green-200"
               : "bg-red-50 text-red-800 border border-red-200"
           }`}
         >
-          <div className="flex items-center justify-between gap-2">
-            <span>{message}</span>
-            {sheetUrl && (
-              <a
-                href={sheetUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline font-semibold hover:opacity-75"
-              >
-                View Sheet ↗
-              </a>
-            )}
-          </div>
+          <span>{message}</span>
+          {sheetUrl && (
+            <a
+              href={sheetUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline font-semibold hover:opacity-75 whitespace-nowrap"
+            >
+              View Sheet ↗
+            </a>
+          )}
         </div>
       )}
 
       {error && (
-        <div className="p-3 bg-yellow-50 rounded text-sm text-yellow-800 border border-yellow-200">
-          <p className="font-medium">Error:</p>
-          <p>{error}</p>
+        <div className="mt-4 px-4 py-3 bg-amber-50 rounded-xl text-sm text-amber-800 border border-amber-200">
+          {error}
         </div>
       )}
 
-      <div className="p-3 bg-blue-50 rounded text-sm text-gray-700 border border-blue-200">
-        <p className="font-medium mb-2">How to use:</p>
-        <ol className="list-decimal list-inside space-y-1">
-          <li>
-            {isAuthenticated
-              ? "Click 'Export to Google Sheets' to create a new sheet"
-              : "Click 'Authorize Google Sheets' to connect your account"}
-          </li>
-          <li>
-            {isAuthenticated
-              ? "The data will be automatically created in a new Google Sheet"
-              : "Follow the Google login flow"}
-          </li>
-          <li>
-            {isAuthenticated
-              ? "Click 'View Sheet ↗' to open it in Google Sheets"
-              : "After authorizing, you can export your data"}
-          </li>
-        </ol>
-      </div>
+      {!isAuthenticated && (
+        <p className="mt-3 text-xs text-gray-400">
+          Google Sheets export requires a one-time OAuth authorisation. CSV download works without any login.
+        </p>
+      )}
     </div>
   );
 }

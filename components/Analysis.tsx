@@ -12,168 +12,106 @@ interface AnalysisProps {
   insights: CompanyInsights;
 }
 
+function GrowthCell({ value }: { value: number }) {
+  const positive = value > 0;
+  const neutral = value === 0;
+  return (
+    <td className="px-6 py-3 text-right">
+      <span
+        className={`inline-flex items-center gap-1 text-sm font-semibold ${
+          neutral
+            ? "text-gray-500"
+            : positive
+            ? "text-green-600"
+            : "text-red-600"
+        }`}
+      >
+        {!neutral && (
+          <span className="text-xs">{positive ? "▲" : "▼"}</span>
+        )}
+        {formatPercentage(Math.abs(value))}
+      </span>
+    </td>
+  );
+}
+
 export default function Analysis({ insights }: AnalysisProps) {
   const [activeTab, setActiveTab] = useState<"qoq" | "yoy">("qoq");
 
   const qoqData = calculateQoQAnalysis(insights.financialResults);
   const yoyData = calculateYoYAnalysis(insights.financialResults);
 
-  const getGrowthColor = (value: number) => {
-    if (value > 0) return "text-green-600";
-    if (value < 0) return "text-red-600";
-    return "text-gray-600";
-  };
+  if (qoqData.length === 0 && yoyData.length === 0) return null;
+
+  const tabs = [
+    { key: "qoq" as const, label: "QoQ Analysis" },
+    { key: "yoy" as const, label: "YoY Analysis" },
+  ];
+
+  const cols = ["Quarter / Period", "Revenue Growth", "Profit Growth", "EPS Growth"];
+  const activeData = activeTab === "qoq" ? qoqData : yoyData;
 
   return (
-    <div className="bg-white rounded-lg shadow overflow-hidden">
-      <div className="px-6 py-4 border-b bg-gray-50">
-        <h3 className="text-lg font-semibold">Financial Analysis</h3>
-      </div>
-
-      <div className="border-b">
-        <div className="flex">
-          <button
-            onClick={() => setActiveTab("qoq")}
-            className={`flex-1 px-6 py-3 font-medium text-center ${
-              activeTab === "qoq"
-                ? "border-b-2 border-blue-600 text-blue-600"
-                : "text-gray-600 hover:text-gray-900"
-            }`}
-          >
-            QoQ Analysis
-          </button>
-          <button
-            onClick={() => setActiveTab("yoy")}
-            className={`flex-1 px-6 py-3 font-medium text-center ${
-              activeTab === "yoy"
-                ? "border-b-2 border-blue-600 text-blue-600"
-                : "text-gray-600 hover:text-gray-900"
-            }`}
-          >
-            YoY Analysis
-          </button>
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+      <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+        <h3 className="font-semibold text-gray-900">Growth Analysis</h3>
+        <div className="flex bg-gray-100 rounded-xl p-1 gap-1">
+          {tabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setActiveTab(t.key)}
+              className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                activeTab === t.key
+                  ? "bg-white text-blue-600 shadow-sm"
+                  : "text-gray-500 hover:text-gray-700"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
       </div>
 
       <div className="overflow-x-auto">
-        {activeTab === "qoq" ? (
-          <table className="w-full text-sm">
-            <thead className="bg-gray-100 border-b">
-              <tr>
-                <th className="px-6 py-3 text-left font-semibold">Quarter</th>
-                <th className="px-6 py-3 text-right font-semibold">
-                  Revenue Growth
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-gray-50 border-b border-gray-100 text-xs text-gray-500 uppercase tracking-wide">
+              {cols.map((c) => (
+                <th
+                  key={c}
+                  className={`px-6 py-3 font-semibold ${c === "Quarter / Period" ? "text-left" : "text-right"}`}
+                >
+                  {c}
                 </th>
-                <th className="px-6 py-3 text-right font-semibold">
-                  Profit Growth
-                </th>
-                <th className="px-6 py-3 text-right font-semibold">
-                  EPS Growth
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {qoqData.length > 0 ? (
-                qoqData.map((data, idx) => (
-                  <tr
-                    key={idx}
-                    className={idx % 2 === 0 ? "bg-white" : "bg-gray-50"}
-                  >
-                    <td className="px-6 py-3 font-medium">{data.quarter}</td>
-                    <td
-                      className={`px-6 py-3 text-right font-medium ${getGrowthColor(
-                        data.revenueGrowth
-                      )}`}
-                    >
-                      {formatPercentage(data.revenueGrowth)}
-                    </td>
-                    <td
-                      className={`px-6 py-3 text-right font-medium ${getGrowthColor(
-                        data.profitGrowth
-                      )}`}
-                    >
-                      {formatPercentage(data.profitGrowth)}
-                    </td>
-                    <td
-                      className={`px-6 py-3 text-right font-medium ${getGrowthColor(
-                        data.epsGrowth
-                      )}`}
-                    >
-                      {formatPercentage(data.epsGrowth)}
-                    </td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={4} className="px-6 py-8 text-center text-gray-500">
-                    Insufficient data for QoQ analysis
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-50">
+            {activeData.length > 0 ? (
+              activeData.map((data, idx) => (
+                <tr key={idx} className="hover:bg-blue-50/40 transition-colors">
+                  <td className="px-6 py-3 font-medium text-gray-900">
+                    {"quarter" in data && "year" in data
+                      ? `${data.quarter} ${data.year}`
+                      : (data as { quarter: string }).quarter}
                   </td>
+                  <GrowthCell value={data.revenueGrowth} />
+                  <GrowthCell value={data.profitGrowth} />
+                  <GrowthCell value={data.epsGrowth} />
                 </tr>
-              )}
-            </tbody>
-          </table>
-        ) : (
-          <table className="w-full text-sm">
-            <thead className="bg-gray-100 border-b">
+              ))
+            ) : (
               <tr>
-                <th className="px-6 py-3 text-left font-semibold">
-                  Period
-                </th>
-                <th className="px-6 py-3 text-right font-semibold">
-                  Revenue Growth
-                </th>
-                <th className="px-6 py-3 text-right font-semibold">
-                  Profit Growth
-                </th>
-                <th className="px-6 py-3 text-right font-semibold">
-                  EPS Growth
-                </th>
+                <td colSpan={4} className="px-6 py-10 text-center text-gray-400 text-sm">
+                  Insufficient data for {activeTab.toUpperCase()} analysis
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {yoyData.length > 0 ? (
-                yoyData.map((data, idx) => (
-                  <tr
-                    key={idx}
-                    className={idx % 2 === 0 ? "bg-white" : "bg-gray-50"}
-                  >
-                    <td className="px-6 py-3 font-medium">
-                      {data.quarter} {data.year}
-                    </td>
-                    <td
-                      className={`px-6 py-3 text-right font-medium ${getGrowthColor(
-                        data.revenueGrowth
-                      )}`}
-                    >
-                      {formatPercentage(data.revenueGrowth)}
-                    </td>
-                    <td
-                      className={`px-6 py-3 text-right font-medium ${getGrowthColor(
-                        data.profitGrowth
-                      )}`}
-                    >
-                      {formatPercentage(data.profitGrowth)}
-                    </td>
-                    <td
-                      className={`px-6 py-3 text-right font-medium ${getGrowthColor(
-                        data.epsGrowth
-                      )}`}
-                    >
-                      {formatPercentage(data.epsGrowth)}
-                    </td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={4} className="px-6 py-8 text-center text-gray-500">
-                    Insufficient data for YoY analysis
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        )}
+            )}
+          </tbody>
+        </table>
       </div>
     </div>
   );
 }
+
+
