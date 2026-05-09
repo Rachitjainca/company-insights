@@ -16,6 +16,8 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
   const [sheetUrl, setSheetUrl] = useState("");
   const [showSuccess, setShowSuccess] = useState(false);
   const [xbrlMode, setXbrlMode] = useState(false);
+  const [includeContent, setIncludeContent] = useState(true);
+  const [createGoogleDocs, setCreateGoogleDocs] = useState(true);
 
   // Whether any selected doc has an XBRL URL and is a quarterly result
   const hasXbrlDocs = selectedDocs.some(
@@ -27,6 +29,17 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
     const t = setTimeout(() => { setMessage(""); setShowSuccess(false); }, 5000);
     return () => clearTimeout(t);
   }, [message]);
+
+  useEffect(() => {
+    // Guard against stale toggle state when selection changes.
+    if (!hasXbrlDocs && xbrlMode) setXbrlMode(false);
+  }, [hasXbrlDocs, xbrlMode]);
+
+  useEffect(() => {
+    if (!includeContent && createGoogleDocs) {
+      setCreateGoogleDocs(false);
+    }
+  }, [includeContent, createGoogleDocs]);
 
   const handleExport = async () => {
     setMessage("");
@@ -42,6 +55,8 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
         company,
         documents: selectedDocs,
         exportMode: xbrlMode ? "xbrl" : "metadata",
+        includeContent,
+        createGoogleDocs,
       });
       if (result.success) {
         setSheetUrl(result.sheetUrl ?? "");
@@ -83,6 +98,40 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
         </label>
       )}
 
+      {!xbrlMode && (
+        <label className="flex items-start gap-2 mb-3 cursor-pointer group">
+          <input
+            type="checkbox"
+            checked={includeContent}
+            onChange={(e) => setIncludeContent(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+          />
+          <span className="text-sm text-gray-700 group-hover:text-gray-900 leading-snug">
+            <span className="font-medium">Include file content (not just URLs)</span>
+            <span className="block text-xs text-gray-400 mt-0.5">
+              Extracts text from each selected file (PDF/HTML/XML/TXT when available) and writes it into the sheet.
+            </span>
+          </span>
+        </label>
+      )}
+
+      {!xbrlMode && includeContent && (
+        <label className="flex items-start gap-2 mb-4 cursor-pointer group">
+          <input
+            type="checkbox"
+            checked={createGoogleDocs}
+            onChange={(e) => setCreateGoogleDocs(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+          />
+          <span className="text-sm text-gray-700 group-hover:text-gray-900 leading-snug">
+            <span className="font-medium">Also create a Google Doc per file</span>
+            <span className="block text-xs text-gray-400 mt-0.5">
+              Stores full extracted text in separate Google Docs and adds the doc links in your sheet.
+            </span>
+          </span>
+        </label>
+      )}
+
       <button
         onClick={handleExport}
         disabled={disabled}
@@ -98,7 +147,13 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
             {isAuthenticated ? "Creating Sheet…" : "Authorising…"}
           </>
         ) : isAuthenticated ? (
-          <>{xbrlMode ? "📊 Export XBRL to Sheets" : "📊 Export to Google Sheets"}</>
+          <>
+            {xbrlMode
+              ? "📊 Export XBRL to Sheets"
+              : includeContent
+              ? "📄 Export File Content to Sheets"
+              : "📊 Export Links to Google Sheets"}
+          </>
         ) : (
           <>🔑 Connect Google Sheets</>
         )}

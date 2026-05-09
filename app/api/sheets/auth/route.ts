@@ -26,6 +26,7 @@ export async function GET() {
     authUrl.searchParams.append("scope", [
       "https://www.googleapis.com/auth/spreadsheets",
       "https://www.googleapis.com/auth/drive.file",
+      "https://www.googleapis.com/auth/documents",
     ].join(" "));
     authUrl.searchParams.append("access_type", "offline");
     authUrl.searchParams.append("prompt", "consent");

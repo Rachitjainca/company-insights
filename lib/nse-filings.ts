@@ -24,6 +24,7 @@ interface NSEFinancialResult {
   resultDetailedDataLink: string | null;
   fromDate: string;
   toDate: string;
+  seqNumber?: string;
 }
 
 interface NSEAnnualReport {
@@ -107,6 +108,14 @@ function detectType(fileName: string): DocumentLinkType {
   return "other";
 }
 
+function buildQuarterlyFallbackUrl(symbol: string, row: NSEFinancialResult): string {
+  const seq = row.seqNumber ?? `${row.fromDate}-${row.toDate}-${row.consolidated}`;
+  return (
+    "https://www.nseindia.com/companies-listing/corporate-filings-financial-results" +
+    `?symbol=${encodeURIComponent(symbol)}&seq=${encodeURIComponent(seq)}`
+  );
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -157,7 +166,7 @@ export async function fetchNSEQuarterlyResults(symbol: string): Promise<IRDocume
         ? row.xbrl
         : htmlLink && htmlLink !== "-"
         ? htmlLink
-        : "#";
+        : buildQuarterlyFallbackUrl(symbol, row);
 
       const doc: IRDocument = {
         category: "quarterly-results" as IRCategory,

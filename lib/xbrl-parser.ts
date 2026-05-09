@@ -168,13 +168,18 @@ function extractXBRLMetrics(xml: string): XBRLMetrics {
 
     // Exclude prior-period contexts (comparative data)
     const currentPoints = points.filter(
-      (p) => !PRIOR_PERIOD_PATTERNS.some((pat) => p.contextRef.includes(pat))
+      (p) => !isPriorPeriodContext(p.contextRef)
     );
     const chosen = currentPoints[0] ?? points[0];
     if (chosen != null) result[label] = chosen.value;
   }
 
   return result;
+}
+
+function isPriorPeriodContext(contextRef: string): boolean {
+  const lower = contextRef.toLowerCase();
+  return PRIOR_PERIOD_PATTERNS.some((pat) => lower.includes(pat.toLowerCase()));
 }
 
 /**
@@ -203,8 +208,8 @@ function collectDataPoints(
       for (const item of value) {
         if (typeof item === "object" && item !== null) {
           const v = item as Record<string, unknown>;
-          tryExtract(localName, v, out);
-          if (!tryExtract(localName, v, out)) {
+          const extracted = tryExtract(localName, v, out);
+          if (!extracted) {
             collectDataPoints(item, out);
           }
         }
@@ -232,7 +237,9 @@ function tryExtract(
 
   if (rawText === undefined || contextRef === undefined) return false;
 
-  const num = Number(rawText);
+  const normalized =
+    typeof rawText === "string" ? rawText.replace(/,/g, "").trim() : rawText;
+  const num = Number(normalized);
   if (isNaN(num)) return false;
 
   if (!out[localName]) out[localName] = [];

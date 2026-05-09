@@ -69,7 +69,7 @@ export default function Home() {
               </h1>
               <p className="text-blue-100 text-lg mb-10 max-w-2xl mx-auto">
                 Search any NSE-listed company to access quarterly results, investor presentations,
-                concall transcripts, annual reports, and KPI handbooks � then export to Google Sheets.
+                concall transcripts, annual reports, and KPI handbooks - then export to Google Sheets.
               </p>
               <CompanySearch onSelect={handleSelect} />
             </div>
@@ -121,7 +121,7 @@ export default function Home() {
 
       <footer className="border-t border-gray-200 bg-white mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-gray-400">
-          <span>� {new Date().getFullYear()} Company Insights. Built with Next.js.</span>
+          <span>(c) {new Date().getFullYear()} Company Insights. Built with Next.js.</span>
           <span>
             Stock list sourced from{" "}
             <a

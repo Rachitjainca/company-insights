@@ -61,42 +61,55 @@ function DocRow({
 }) {
   const key = docKey(doc);
   const period = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" · ");
+  const canOpen = /^https?:\/\//i.test(doc.url);
 
   return (
-    <label className="flex items-start gap-3 px-5 py-3 hover:bg-gray-50 cursor-pointer group">
+    <div className="flex items-start gap-3 px-5 py-3 hover:bg-gray-50 group">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onToggle(key, e.target.checked)}
         className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 shrink-0"
       />
-      <div className="flex-1 min-w-0">
+      <button
+        type="button"
+        onClick={() => onToggle(key, !checked)}
+        className="flex-1 min-w-0 text-left"
+      >
         <p className="text-sm text-gray-900 font-medium leading-snug line-clamp-2 group-hover:text-blue-700">
           {doc.title}
         </p>
         <p className="text-xs text-gray-400 mt-0.5">{period}</p>
-      </div>
+      </button>
       <div className="flex items-center gap-2 shrink-0 mt-0.5">
         <span
           className={`text-[11px] font-semibold px-1.5 py-0.5 rounded border ${TYPE_STYLE[doc.type]}`}
         >
           {TYPE_LABEL[doc.type]}
         </span>
-        <a
-          href={doc.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="text-gray-400 hover:text-blue-600 transition-colors"
-          title="Open document"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-              d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-          </svg>
-        </a>
+        {canOpen ? (
+          <a
+            href={doc.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-gray-400 hover:text-blue-600 transition-colors"
+            title="Open document"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+            </svg>
+          </a>
+        ) : (
+          <span className="text-gray-300" title="Document link unavailable">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M18.364 5.636a9 9 0 010 12.728m-12.728 0a9 9 0 010-12.728m2.122 2.122a6 6 0 000 8.484m8.484 0a6 6 0 000-8.484M9 12h6" />
+            </svg>
+          </span>
+        )}
       </div>
-    </label>
+    </div>
   );
 }
 
