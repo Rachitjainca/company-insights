@@ -136,11 +136,11 @@ function extractPeriod(headline: string): { fiscalYear: string; quarter?: string
 }
 
 function buildDocUrl(raw: BSEFilingRaw): string {
-  // BSE API does not populate ATTACHMENTURL. The correct link is:
-  // https://www.bseindia.com/xml-data/corpfiling/AttachLive/{ATTACHMENTNAME}
+  // BSE CDN uses hotlink-protection: direct links from external referrers get 404.
+  // Route through our server-side proxy (/api/bse-doc) which adds the correct Referer.
   const name = raw.ATTACHMENTNAME?.trim();
-  if (name) return `${BSE_CDN}/xml-data/corpfiling/AttachLive/${name}`;
-  // Last-resort: BSE filing news page (human-readable, not a direct PDF)
+  if (name) return `/api/bse-doc?name=${encodeURIComponent(name)}`;
+  // Last-resort: BSE stock page for this company (human-readable fallback)
   if (raw.NEWSID)
     return `${BSE_CDN}/markets/MarketInfo/DispNewNoticesCirc.aspx?id=${raw.NEWSID}`;
   return BSE_CDN;
