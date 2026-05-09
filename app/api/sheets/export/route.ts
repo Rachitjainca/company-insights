@@ -167,11 +167,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    let token = accessToken;
+    let token: string | undefined = accessToken;
 
     // If access token is expired, try to refresh it
     if (!token && refreshToken) {
-      token = await refreshAccessToken(refreshToken);
+      token = (await refreshAccessToken(refreshToken)) ?? undefined;
       if (!token) {
         return NextResponse.json(
           {
@@ -181,6 +181,16 @@ export async function POST(request: NextRequest) {
           { status: 401 }
         );
       }
+    }
+
+    if (!token) {
+      return NextResponse.json(
+        {
+          error: "Not authenticated. Please authorize Google Sheets access first.",
+          code: "NOT_AUTHENTICATED",
+        },
+        { status: 401 }
+      );
     }
 
     // Parse request body
