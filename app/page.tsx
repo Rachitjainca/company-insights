@@ -61,46 +61,66 @@ export default function Home() {
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 text-center">
               <div className="inline-flex items-center gap-2 bg-white/20 text-white text-xs font-semibold px-3 py-1 rounded-full mb-6">
                 <span className="w-2 h-2 bg-green-300 rounded-full animate-pulse" />
-                Live NSE stock list
+                Live NSE + BSE data
               </div>
               <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight mb-4">
                 NSE Investor Relations,
                 <br className="hidden sm:block" /> in one place.
               </h1>
-              <p className="text-blue-100 text-lg mb-10 max-w-2xl mx-auto">
-                Search any NSE-listed company to access quarterly results, investor presentations,
-                concall transcripts, annual reports, and KPI handbooks - then export to Google Sheets.
+              <p className="text-blue-100 text-lg mb-8 max-w-2xl mx-auto">
+                Search any NSE-listed company to instantly access IR documents across 5 categories
+                — then export to Google Sheets with one click.
               </p>
               <CompanySearch onSelect={handleSelect} />
+
+              {/* Feature pills */}
+              <div className="flex flex-wrap justify-center gap-2.5 mt-8">
+                {[
+                  { label: "Quarterly Results", color: "bg-blue-500/30 text-blue-100" },
+                  { label: "Investor Presentations", color: "bg-violet-500/30 text-violet-100" },
+                  { label: "Concall Transcripts", color: "bg-amber-500/30 text-amber-100" },
+                  { label: "Annual Reports", color: "bg-emerald-500/30 text-emerald-100" },
+                  { label: "KPI Handbooks", color: "bg-rose-500/30 text-rose-100" },
+                ].map(({ label, color }) => (
+                  <span key={label} className={`text-xs font-semibold px-3 py-1.5 rounded-full ${color}`}>
+                    {label}
+                  </span>
+                ))}
+              </div>
             </div>
           </div>
         </main>
       ) : (
         /* Results screen */
-        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        <main className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-5">
           {/* Company header */}
-          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm px-6 py-5 flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-4">
-              <div className="w-12 h-12 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold text-lg shrink-0">
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-4 min-w-0">
+              <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-blue-500 to-blue-700 text-white flex items-center justify-center font-black text-sm shrink-0 shadow-sm">
                 {selectedCompany.symbol.slice(0, 2)}
               </div>
-              <div>
-                <h2 className="text-xl font-bold text-gray-900 leading-tight">
+              <div className="min-w-0">
+                <h2 className="text-lg font-bold text-gray-900 leading-tight truncate">
                   {selectedCompany.name}
                 </h2>
-                <div className="flex flex-wrap gap-2 mt-1">
-                  <span className="bg-blue-50 text-blue-700 text-xs font-semibold px-2 py-0.5 rounded-full">
+                <div className="flex flex-wrap gap-1.5 mt-1">
+                  <span className="bg-blue-50 text-blue-700 text-[11px] font-bold px-2 py-0.5 rounded-full border border-blue-100">
                     {selectedCompany.symbol}
                   </span>
-                  <span className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full font-mono">
+                  <span className="bg-gray-50 text-gray-500 text-[11px] px-2 py-0.5 rounded-full font-mono border border-gray-100">
                     {selectedCompany.isin}
                   </span>
+                  {selectedDocs.length > 0 && (
+                    <span className="bg-blue-600 text-white text-[11px] font-bold px-2 py-0.5 rounded-full">
+                      {selectedDocs.length} selected
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
             <button
               onClick={() => { setSelectedCompany(null); setSelectedDocs([]); }}
-              className="inline-flex items-center gap-1.5 text-sm text-gray-600 hover:text-gray-900 bg-gray-100 hover:bg-gray-200 px-4 py-2 rounded-xl font-medium transition-colors"
+              className="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-900 bg-gray-100 hover:bg-gray-200 px-3 py-2 rounded-xl font-medium transition-colors shrink-0"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />

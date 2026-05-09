@@ -33,6 +33,23 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
+  const POPULAR_SYMBOLS = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "WIPRO", "LT"];
+
+  const handleQuickPick = (sym: string) => {
+    setError("");
+    setHighlighted(0);
+    const q = sym.toLowerCase();
+    const exact = equities.find((s) => s.symbol.toLowerCase() === q);
+    if (exact) {
+      selectEquity(exact);
+      return;
+    }
+    const matches = equities.filter((s) => s.symbol.toLowerCase().startsWith(q)).slice(0, 10);
+    setQuery(sym);
+    setSuggestions(matches);
+    inputRef.current?.focus();
+  };
+
   // Fetch NSE list once on mount
   useEffect(() => {
     fetch("/api/nse/equities")
@@ -181,6 +198,23 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
           </div>
         )}
       </div>
+
+      {/* Popular quick picks */}
+      {!query && !listLoading && !listError && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-gray-400 font-medium">Popular:</span>
+          {POPULAR_SYMBOLS.map((sym) => (
+            <button
+              key={sym}
+              type="button"
+              onClick={() => handleQuickPick(sym)}
+              className="text-xs font-mono font-semibold px-2.5 py-1 rounded-lg bg-white border border-gray-200 text-gray-600 hover:border-blue-400 hover:text-blue-700 hover:bg-blue-50 transition-all"
+            >
+              {sym}
+            </button>
+          ))}
+        </div>
+      )}
 
       {error && (
         <div className="mt-3 flex items-center gap-2 text-red-600 text-sm font-medium bg-red-50 border border-red-200 rounded-xl px-4 py-2">
