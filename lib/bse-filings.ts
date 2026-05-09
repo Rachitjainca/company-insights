@@ -18,8 +18,7 @@ interface BSEFilingRaw {
   NEWSID?: string;
   DissemDT?: string;     // "20240115120000" or similar
   HEADLINE?: string;
-  ATTACHMENTNAME?: string; // filename used to derive type
-  ATTACHMENTURL?: string;  // relative path on BSE CDN
+  ATTACHMENTNAME?: string; // UUID-based PDF filename, e.g. "b690d1d2-....pdf"
   NEWSSUB?: string;        // sub-category label
 }
 
@@ -137,11 +136,13 @@ function extractPeriod(headline: string): { fiscalYear: string; quarter?: string
 }
 
 function buildDocUrl(raw: BSEFilingRaw): string {
-  const attach = raw.ATTACHMENTURL ?? "";
-  if (attach.startsWith("http")) return attach;
-  if (attach) return `${BSE_CDN}/${attach.replace(/^\//, "")}`;
-  // Fallback: link to BSE filing detail page
-  if (raw.NEWSID) return `${BSE_CDN}/xml-data/corpfiling/AttachLive/${raw.NEWSID}.pdf`;
+  // BSE API does not populate ATTACHMENTURL. The correct link is:
+  // https://www.bseindia.com/xml-data/corpfiling/AttachLive/{ATTACHMENTNAME}
+  const name = raw.ATTACHMENTNAME?.trim();
+  if (name) return `${BSE_CDN}/xml-data/corpfiling/AttachLive/${name}`;
+  // Last-resort: BSE filing news page (human-readable, not a direct PDF)
+  if (raw.NEWSID)
+    return `${BSE_CDN}/markets/MarketInfo/DispNewNoticesCirc.aspx?id=${raw.NEWSID}`;
   return BSE_CDN;
 }
 
