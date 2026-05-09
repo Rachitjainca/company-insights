@@ -54,7 +54,52 @@ const NSE_HEADERS: HeadersInit = {
   Accept: "application/json, text/plain, */*",
   "Accept-Language": "en-US,en;q=0.9",
   Referer: "https://www.nseindia.com/",
+  "X-Requested-With": "XMLHttpRequest",
 };
+
+// ─── NSE session cookie preflight ─────────────────────────────────────────────
+//
+// NSE uses Akamai bot-detection.  API calls without a valid session cookie
+// return HTML error pages (HTTP 200 with non-JSON body) or HTTP 403/401.
+// We establish a session by hitting the public market-data page first, then
+// re-use those cookies across all API calls within the same process.
+
+interface NSESession {
+  cookie: string;
+  ts: number;
+}
+
+let nseSession: NSESession | null = null;
+const NSE_SESSION_TTL_MS = 8 * 60 * 1000; // 8 minutes (NSE tokens short-lived)
+
+async function getNSECookie(): Promise<string> {
+  if (nseSession && Date.now() - nseSession.ts < NSE_SESSION_TTL_MS) {
+    return nseSession.cookie;
+  }
+  try {
+    const res = await fetch("https://www.nseindia.com/market-data/live-equity-market", {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      redirect: "follow",
+    });
+    // getSetCookie() is available in Node 18+ / undici
+    const setCookieHeaders: string[] =
+      typeof (res.headers as Record<string, unknown>).getSetCookie === "function"
+        ? (res.headers as unknown as { getSetCookie(): string[] }).getSetCookie()
+        : [];
+    const cookiePairs = setCookieHeaders.map((c) => c.split(";")[0].trim());
+    const cookie = cookiePairs.filter(Boolean).join("; ");
+    nseSession = { cookie, ts: Date.now() };
+    return cookie;
+  } catch {
+    return "";
+  }
+}
 
 // Maximum number of quarterly results to return (newest first).
 // 40 results ≈ 5 years of Consolidated + Non-Consolidated pairs per quarter.
@@ -133,14 +178,19 @@ export async function fetchNSEQuarterlyResults(symbol: string): Promise<IRDocume
       `https://www.nseindia.com/api/corporates-financial-results` +
       `?index=equities&symbol=${encodeURIComponent(symbol)}`;
 
+    const cookie = await getNSECookie();
     const res = await fetch(url, {
-      headers: NSE_HEADERS,
+      headers: { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) },
       next: { revalidate: 3600 },
     });
 
     if (!res.ok) return [];
 
-    const data: NSEFinancialResult[] = await res.json();
+    // NSE returns HTML error pages (bot-blocked) with status 200 — validate JSON
+    const text = await res.text();
+    if (!text.trimStart().startsWith("[") && !text.trimStart().startsWith("{")) return [];
+
+    const data: NSEFinancialResult[] = JSON.parse(text);
 
     const docs: IRDocument[] = [];
 
@@ -200,34 +250,42 @@ export async function fetchNSEAnnualReports(symbol: string): Promise<IRDocument[
   try {
     const base = `https://www.nseindia.com/api`;
     const sym = encodeURIComponent(symbol);
+    const cookie = await getNSECookie();
+    const headers = { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) };
 
     const [annualRes, xbrlRes] = await Promise.allSettled([
       fetch(`${base}/annual-reports?index=equities&symbol=${sym}`, {
-        headers: NSE_HEADERS,
+        headers,
         next: { revalidate: 86400 },
       }),
       fetch(`${base}/annual-reports-xbrl?index=equities&symbol=${sym}`, {
-        headers: NSE_HEADERS,
+        headers,
         next: { revalidate: 86400 },
       }),
     ]);
 
-    // Parse annual reports
+    // Parse annual reports — validate JSON body before parsing
     const annualData: NSEAnnualReport[] = [];
     if (annualRes.status === "fulfilled" && annualRes.value.ok) {
-      const json = await annualRes.value.json();
-      if (Array.isArray(json?.data)) annualData.push(...json.data);
+      const text = await annualRes.value.text();
+      if (text.trimStart().startsWith("{") || text.trimStart().startsWith("[")) {
+        const json = JSON.parse(text);
+        if (Array.isArray(json?.data)) annualData.push(...json.data);
+      }
     }
 
     // Parse XBRL annual reports — build a lookup keyed by "toYr|submission_type"
     const xbrlByKey = new Map<string, string>();
     if (xbrlRes.status === "fulfilled" && xbrlRes.value.ok) {
-      const json = await xbrlRes.value.json();
-      if (Array.isArray(json?.data)) {
-        for (const row of json.data as NSEAnnualReportXBRL[]) {
-          if (row.fileName && row.fileName.endsWith(".xml")) {
-            const key = `${row.toYr}|${row.submission_type}`;
-            if (!xbrlByKey.has(key)) xbrlByKey.set(key, row.fileName);
+      const text = await xbrlRes.value.text();
+      if (text.trimStart().startsWith("{") || text.trimStart().startsWith("[")) {
+        const json = JSON.parse(text);
+        if (Array.isArray(json?.data)) {
+          for (const row of json.data as NSEAnnualReportXBRL[]) {
+            if (row.fileName && row.fileName.endsWith(".xml")) {
+              const key = `${row.toYr}|${row.submission_type}`;
+              if (!xbrlByKey.has(key)) xbrlByKey.set(key, row.fileName);
+            }
           }
         }
       }

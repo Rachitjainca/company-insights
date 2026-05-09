@@ -129,12 +129,18 @@ export async function GET(
   const bseCodeValue = bseCode.status === "fulfilled" ? bseCode.value : null;
   if (bseCodeValue) {
     const bseDocs = await fetchBSEFilings(bseCodeValue);
-    const bseCategoriesToKeep = new Set<IRCategory>([
-      "investor-presentation",
-      "concall",
-      "kpi-handbook",
-    ]);
-    docs.push(...bseDocs.filter((d) => bseCategoriesToKeep.has(d.category)));
+
+    // BSE is primary for presentations/concalls/KPIs.
+    // For quarterly-results and annual-report, prefer NSE but fall back to BSE
+    // when NSE returned nothing (e.g., bot-blocked in production).
+    const nseHasQuarterly = docs.some((d) => d.category === "quarterly-results");
+    const nseHasAnnual = docs.some((d) => d.category === "annual-report");
+
+    for (const d of bseDocs) {
+      if (d.category === "quarterly-results" && nseHasQuarterly) continue;
+      if (d.category === "annual-report" && nseHasAnnual) continue;
+      docs.push(d);
+    }
   }
 
   const dedupedDocs = dedup(docs);
@@ -151,6 +157,17 @@ export async function GET(
     grouped[doc.category].push(doc);
   }
 
+  // Diagnostic: report which sources returned data so the UI can show warnings
+  const sources = {
+    scraper: scraperResult.status === "fulfilled" && scraperResult.value !== null,
+    nseQuarterly:
+      nseQuarterlyResult.status === "fulfilled" && nseQuarterlyResult.value.length > 0,
+    nseAnnual:
+      nseAnnualResult.status === "fulfilled" && nseAnnualResult.value.length > 0,
+    bseCode: bseCodeValue ?? null,
+    bseFilings: bseCodeValue !== null,
+  };
+
   return NextResponse.json(
     {
       ticker: upperTicker,
@@ -159,6 +176,7 @@ export async function GET(
       documents: grouped,
       totalCount: dedupedDocs.length,
       fetchedAt: new Date().toISOString(),
+      sources,
     },
     {
       headers: {

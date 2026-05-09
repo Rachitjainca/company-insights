@@ -5,13 +5,12 @@ import type { IRCategory, IRDocument, DocumentLinkType } from "@/types/financial
 
 // ─── BSE API response shapes ──────────────────────────────────────────────────
 
-interface BSEScripHeader {
-  Scrip_Cd: string; // BSE scrip code, e.g. "500112"
-  long_name?: string;
-}
-
-interface BSEScripHeaderResponse {
-  Header?: BSEScripHeader;
+interface BSEScripListItem {
+  SCRIP_CD: string;   // numeric BSE code, e.g. "532540"
+  scrip_id: string;   // short ticker that matches NSE symbol, e.g. "TCS"
+  Scrip_Name: string;
+  Status: string;
+  Segment: string;
 }
 
 interface BSEFilingRaw {
@@ -32,18 +31,20 @@ interface BSEFilingsResponse {
 
 const BSE_CDN = "https://www.bseindia.com";
 
-// Keyword patterns to classify filing headlines into IR categories
+// Keyword patterns to classify filing headlines into IR categories.
+// Order matters: first match wins. More specific patterns are listed first.
 const CATEGORY_PATTERNS: Array<{ category: IRCategory; patterns: RegExp[] }> = [
   {
-    category: "quarterly-results",
+    category: "concall",
     patterns: [
-      /quarterly\s+result/i,
-      /financial\s+result/i,
-      /q[1-4]\s*(fy|20)/i,
-      /unaudited\s+result/i,
-      /audited\s+result/i,
-      /standalone\s+result/i,
-      /consolidated\s+result/i,
+      /earnings\s+call/i,
+      /concall/i,
+      /con\s+call/i,
+      /conference\s+call/i,
+      /analyst\s+(meet|call|day|briefing)/i,
+      /investor\s+(meet|call|briefing|conference)/i,
+      /transcript/i,
+      /q&a\s+session/i,
     ],
   },
   {
@@ -54,17 +55,29 @@ const CATEGORY_PATTERNS: Array<{ category: IRCategory; patterns: RegExp[] }> = [
       /analyst\s+presentation/i,
       /investor\s+update/i,
       /corporate\s+presentation/i,
+      /analyst\s+day/i,
+      /capital\s+market[s]?\s+day/i,
+      /investor\s+day/i,
+      /media\s+briefing/i,
+      /business\s+update/i,
+      /earnings\s+update/i,
+      /strategy\s+presentation/i,
+      /management\s+presentation/i,
+      /roadshow/i,
+      /\bpresentation\b/i,
     ],
   },
   {
-    category: "concall",
+    category: "quarterly-results",
     patterns: [
-      /earnings\s+call/i,
-      /concall/i,
-      /con\s+call/i,
-      /analyst\s+(meet|call|day)/i,
-      /investor\s+(meet|call)/i,
-      /transcript/i,
+      /quarterly\s+result/i,
+      /financial\s+result/i,
+      /q[1-4]\s*(fy|20)/i,
+      /unaudited\s+result/i,
+      /audited\s+result/i,
+      /standalone\s+result/i,
+      /consolidated\s+result/i,
+      /half.?year(?:ly)?\s+result/i,
     ],
   },
   {
@@ -74,6 +87,7 @@ const CATEGORY_PATTERNS: Array<{ category: IRCategory; patterns: RegExp[] }> = [
       /annual\s+general\s+meeting/i,
       /\bagm\b/i,
       /integrated\s+report/i,
+      /sustainability\s+report/i,
     ],
   },
   {
@@ -86,6 +100,8 @@ const CATEGORY_PATTERNS: Array<{ category: IRCategory; patterns: RegExp[] }> = [
       /factsheet/i,
       /data\s+book/i,
       /statistical\s+supplement/i,
+      /operating\s+data/i,
+      /supplemental\s+data/i,
     ],
   },
 ];
@@ -129,27 +145,67 @@ function buildDocUrl(raw: BSEFilingRaw): string {
   return BSE_CDN;
 }
 
+// ─── BSE scrip master cache ────────────────────────────────────────────────────
+//
+// The BSE "getScripHeaderData" API returns null for NSE symbols.
+// Instead, we download the full BSE equity scrip list once per process lifetime
+// (≈1.7 MB / 4800 companies) and filter client-side by `scrip_id`, which
+// matches NSE symbols for dual-listed companies.
+
+let scripMasterCache: BSEScripListItem[] | null = null;
+let scripMasterFetchedAt = 0;
+const SCRIP_MASTER_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+async function getBSEScripMaster(): Promise<BSEScripListItem[]> {
+  if (scripMasterCache && Date.now() - scripMasterFetchedAt < SCRIP_MASTER_TTL_MS) {
+    return scripMasterCache;
+  }
+  try {
+    const res = await fetch(
+      "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w" +
+        "?Group=&Scripcode=&segment=Equity&Status=Active&industry=&scripname=",
+      {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+          Referer: "https://www.bseindia.com/",
+          Origin: "https://www.bseindia.com",
+          Accept: "application/json",
+        },
+        next: { revalidate: 86400 },
+      }
+    );
+    if (!res.ok) return scripMasterCache ?? [];
+    const data: BSEScripListItem[] = await res.json();
+    if (Array.isArray(data) && data.length > 0) {
+      scripMasterCache = data;
+      scripMasterFetchedAt = Date.now();
+    }
+    return scripMasterCache ?? [];
+  } catch {
+    return scripMasterCache ?? [];
+  }
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
  * Resolve the BSE scrip code for an NSE symbol.
- * Returns null if not found or the request fails.
+ *
+ * Strategy: download the full BSE equity list (~4800 companies) and match by
+ * `scrip_id` (BSE's own short ticker), which maps 1:1 to the NSE symbol for
+ * dual-listed companies.  The list is cached for 24 h in process memory.
+ *
+ * Returns null if the symbol is not found or the request fails.
  */
 export async function lookupBSECode(nseSymbol: string): Promise<string | null> {
   try {
-    const url = `https://api.bseindia.com/BseIndiaAPI/api/getScripHeaderData/w?Scripname=${encodeURIComponent(nseSymbol)}`;
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        Referer: "https://www.bseindia.com/",
-        Accept: "application/json",
-      },
-      next: { revalidate: 86400 },
-    });
-    if (!res.ok) return null;
-    const data: BSEScripHeaderResponse = await res.json();
-    return data?.Header?.Scrip_Cd ?? null;
+    const master = await getBSEScripMaster();
+    const upper = nseSymbol.toUpperCase().trim();
+    const match = master.find(
+      (s) => s.scrip_id?.toUpperCase().trim() === upper && s.Segment === "Equity"
+    );
+    return match?.SCRIP_CD ?? null;
   } catch {
     return null;
   }
@@ -172,6 +228,7 @@ export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
         Referer: "https://www.bseindia.com/",
+        Origin: "https://www.bseindia.com",
         Accept: "application/json",
       },
       next: { revalidate: 3600 },
