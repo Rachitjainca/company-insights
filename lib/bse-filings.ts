@@ -255,6 +255,7 @@ export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
         title: headline.trim(),
         url: url2,
         type: detectType(filename),
+        source: "bse",
       });
     }
     return docs;

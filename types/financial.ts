@@ -15,6 +15,8 @@ export interface NSEEquity {
   isin: string;
 }
 
+export type IRSource = "nse" | "bse" | "scraper";
+
 export interface IRDocument {
   category: IRCategory;
   fiscalYear: string;
@@ -24,6 +26,8 @@ export interface IRDocument {
   type: DocumentLinkType;
   /** XBRL XML download URL, when available from NSE */
   xbrlUrl?: string;
+  /** Data source — used for NSE/BSE toggle filter */
+  source?: IRSource;
 }
 
 export interface SelectedDoc extends IRDocument {

@@ -1,12 +1,13 @@
 ﻿"use client";
 
 import { useEffect, useState, useCallback } from "react";
-import type { IRCategory, IRDocument, SelectedDoc, DocumentLinkType } from "@/types/financial";
+import type { IRCategory, IRDocument, IRSource, SelectedDoc, DocumentLinkType } from "@/types/financial";
 
 interface DataSources {
   scraper: boolean;
   nseQuarterly: boolean;
   nseAnnual: boolean;
+  nseAnnouncements: boolean;
   bseCode: string | null;
   bseFilings: boolean;
 }
@@ -331,6 +332,7 @@ export default function CompanyDocuments({
 }: CompanyDocumentsProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
+  const [sourceFilter, setSourceFilter] = useState<"all" | IRSource>("all");
 
   const load = useCallback(() => {
     let cancelled = false;
@@ -429,8 +431,14 @@ export default function CompanyDocuments({
 
   const { data } = state;
   const src = data.sources;
-  const nseOk = !!(src?.nseQuarterly || src?.nseAnnual);
+  const nseOk = !!(src?.nseQuarterly || src?.nseAnnual || src?.nseAnnouncements);
   const bseOk = !!(src?.bseFilings && src?.bseCode);
+
+  // Filter docs by source when a filter is active
+  function filterBySource(docs: IRDocument[]): IRDocument[] {
+    if (sourceFilter === "all") return docs;
+    return docs.filter((d) => d.source === sourceFilter);
+  }
 
   return (
     <div className="space-y-3">
@@ -448,18 +456,38 @@ export default function CompanyDocuments({
             </div>
           )}
         </div>
-        {checkedKeys.size > 0 && (
-          <span className="text-sm font-semibold text-blue-600">
-            {checkedKeys.size} selected
-          </span>
-        )}
+        <div className="flex items-center gap-1.5">
+          {checkedKeys.size > 0 && (
+            <span className="text-sm font-semibold text-blue-600 mr-2">
+              {checkedKeys.size} selected
+            </span>
+          )}
+          {/* Source toggle */}
+          {(nseOk || bseOk) && (
+            <div className="flex items-center rounded-xl border border-gray-200 bg-gray-50 p-0.5 gap-0.5 text-xs font-semibold">
+              {(["all", "nse", "bse"] as const).map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setSourceFilter(f)}
+                  className={`px-2.5 py-1 rounded-lg transition-colors ${
+                    sourceFilter === f
+                      ? "bg-white shadow-sm text-gray-900 border border-gray-200"
+                      : "text-gray-500 hover:text-gray-700"
+                  }`}
+                >
+                  {f === "all" ? "All" : f.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {ORDERED_CATEGORIES.map((cat) => (
         <CategorySection
           key={cat}
           category={cat}
-          docs={data.documents[cat] ?? []}
+          docs={filterBySource(data.documents[cat] ?? [])}
           checkedKeys={checkedKeys}
           onToggle={handleToggle}
           onToggleAll={handleToggleAll}

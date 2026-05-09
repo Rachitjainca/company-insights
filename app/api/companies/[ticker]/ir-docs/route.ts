@@ -12,7 +12,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getScraper } from "@/lib/scrapers/registry";
 import { lookupBSECode, fetchBSEFilings } from "@/lib/bse-filings";
-import { fetchNSEQuarterlyResults, fetchNSEAnnualReports } from "@/lib/nse-filings";
+import { fetchNSEQuarterlyResults, fetchNSEAnnualReports, fetchNSEAnnouncements } from "@/lib/nse-filings";
 import type { IRCategory, IRDocument } from "@/types/financial";
 import type { CompanyDocumentsBundle } from "@/lib/scrapers/types";
 
@@ -66,6 +66,7 @@ function bundleToIRDocs(bundle: CompanyDocumentsBundle): IRDocument[] {
           title: entry.category + (link.label ? ` — ${link.label}` : ""),
           url: link.url,
           type: link.type,
+          source: "scraper",
         });
       }
     }
@@ -92,7 +93,7 @@ export async function GET(
   const upperTicker = ticker.toUpperCase();
 
   // Run all data sources in parallel
-  const [scraperResult, nseQuarterlyResult, nseAnnualResult, bseCode] =
+  const [scraperResult, nseQuarterlyResult, nseAnnualResult, nseAnnouncementsResult, bseCode] =
     await Promise.allSettled([
       (async () => {
         const scraper = getScraper(upperTicker);
@@ -101,6 +102,7 @@ export async function GET(
       })(),
       fetchNSEQuarterlyResults(upperTicker),
       fetchNSEAnnualReports(upperTicker),
+      fetchNSEAnnouncements(upperTicker),
       lookupBSECode(upperTicker),
     ]);
 
@@ -124,7 +126,12 @@ export async function GET(
     docs.push(...nseAnnualResult.value);
   }
 
-  // 4. BSE filings — only keep investor-presentation, concall, kpi-handbook.
+  // 4. NSE corporate announcements — investor presentations and concalls from NSE
+  if (nseAnnouncementsResult.status === "fulfilled") {
+    docs.push(...nseAnnouncementsResult.value);
+  }
+
+  // 5. BSE filings — only keep investor-presentation, concall, kpi-handbook.
   //    NSE is now authoritative for quarterly-results and annual-report.
   const bseCodeValue = bseCode.status === "fulfilled" ? bseCode.value : null;
   if (bseCodeValue) {
@@ -164,6 +171,8 @@ export async function GET(
       nseQuarterlyResult.status === "fulfilled" && nseQuarterlyResult.value.length > 0,
     nseAnnual:
       nseAnnualResult.status === "fulfilled" && nseAnnualResult.value.length > 0,
+    nseAnnouncements:
+      nseAnnouncementsResult.status === "fulfilled" && nseAnnouncementsResult.value.length > 0,
     bseCode: bseCodeValue ?? null,
     bseFilings: bseCodeValue !== null,
   };

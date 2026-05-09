@@ -225,6 +225,7 @@ export async function fetchNSEQuarterlyResults(symbol: string): Promise<IRDocume
         url: displayUrl,
         type: xbrlValid ? "other" : "other",
         xbrlUrl: xbrlValid ? row.xbrl : undefined,
+        source: "nse",
       };
 
       docs.push(doc);
@@ -303,9 +304,91 @@ export async function fetchNSEAnnualReports(symbol: string): Promise<IRDocument[
         url: row.fileName,
         type: detectType(row.fileName),
         xbrlUrl,
+        source: "nse" as const,
       };
     });
 
+    return docs;
+  } catch {
+    return [];
+  }
+}
+
+// ─── NSE Corporate Announcements ─────────────────────────────────────────────
+//
+// NSE lists investor presentations and concall transcripts under
+// /api/corporates-announcements.  Requires the same session cookie preflight
+// as the other NSE APIs.  Returns [] gracefully if API is unavailable.
+
+interface NSEAnnouncement {
+  symbol?: string;
+  subject?: string;
+  an_dt?: string;          // date string e.g. "14-Jan-2025"
+  attachmentFile?: string; // absolute PDF URL
+  desc?: string;
+  pdate?: string;          // alternate date field
+  attchmnt?: string;       // alternate attachment field
+}
+
+// Keyword patterns for announcement subject classification
+const NSE_PRES_RE = /investor\s+presentation|analyst\s+(meet|day|briefing)|earnings\s+presentation|roadshow|business\s+update|earnings\s+update|\bpresentation\b/i;
+const NSE_CONCALL_RE = /concall|con\s+call|conference\s+call|transcript|earnings\s+call/i;
+
+function parseAnnounceDate(raw: NSEAnnouncement): string {
+  const s = raw.an_dt ?? raw.pdate ?? "";
+  // "14-Jan-2025" → extract year
+  const m = s.match(/(\d{4})/);
+  return m ? `FY${m[1]}` : "N/A";
+}
+
+/**
+ * Fetch investor presentations and concall transcripts from NSE corporate
+ * announcements.  Covers the last 3 years of filings.
+ */
+export async function fetchNSEAnnouncements(symbol: string): Promise<IRDocument[]> {
+  try {
+    const cookie = await getNSECookie();
+    const headers = { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) };
+
+    // Build a 3-year date range; NSE expects DD-MM-YYYY
+    const now = new Date();
+    const toDate = `${String(now.getDate()).padStart(2, "0")}-${String(now.getMonth() + 1).padStart(2, "0")}-${now.getFullYear()}`;
+    const fromDate = `01-01-${now.getFullYear() - 3}`;
+
+    const url =
+      `https://www.nseindia.com/api/corporates-announcements` +
+      `?index=equities&symbol=${encodeURIComponent(symbol)}` +
+      `&from_date=${encodeURIComponent(fromDate)}&to_date=${encodeURIComponent(toDate)}`;
+
+    const res = await fetch(url, { headers, next: { revalidate: 3600 } });
+    if (!res.ok) return [];
+
+    const text = await res.text();
+    if (!text.trimStart().startsWith("[") && !text.trimStart().startsWith("{")) return [];
+
+    const data: NSEAnnouncement[] = JSON.parse(text);
+    if (!Array.isArray(data)) return [];
+
+    const docs: IRDocument[] = [];
+    for (const row of data) {
+      const subject = row.subject ?? "";
+      const fileUrl = row.attachmentFile ?? row.attchmnt ?? "";
+      if (!fileUrl || !fileUrl.startsWith("https://")) continue;
+
+      let category: IRCategory | null = null;
+      if (NSE_CONCALL_RE.test(subject)) category = "concall";
+      else if (NSE_PRES_RE.test(subject)) category = "investor-presentation";
+      if (!category) continue;
+
+      docs.push({
+        category,
+        fiscalYear: parseAnnounceDate(row),
+        title: subject.trim() || fileUrl.split("/").pop() || "NSE Document",
+        url: fileUrl,
+        type: detectType(fileUrl),
+        source: "nse",
+      });
+    }
     return docs;
   } catch {
     return [];
