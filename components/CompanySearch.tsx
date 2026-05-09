@@ -1,17 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { CompanyInsights } from "@/types/financial";
-import { fetchCompanyInsights } from "@/lib/mockData";
-
-interface NSEEquity {
-  symbol: string;
-  name: string;
-  isin: string;
-}
+import type { NSEEquity } from "@/types/financial";
 
 interface CompanySearchProps {
-  onSelect: (insights: CompanyInsights) => void;
+  onSelect: (equity: NSEEquity) => void;
 }
 
 function highlight(text: string, query: string) {
@@ -36,7 +29,6 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
   const [listError, setListError] = useState("");
   const [suggestions, setSuggestions] = useState<NSEEquity[]>([]);
   const [highlighted, setHighlighted] = useState(0);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -105,24 +97,11 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
     }
   };
 
-  const selectEquity = async (equity: NSEEquity) => {
-    setLoading(true);
-    setError("");
+  const selectEquity = (equity: NSEEquity) => {
     setSuggestions([]);
-    setQuery(equity.symbol);
-    try {
-      const insights = await fetchCompanyInsights(equity.symbol, equity.name);
-      if (insights) {
-        onSelect(insights);
-        setQuery("");
-      } else {
-        setError(`No financial data available for ${equity.symbol} yet.`);
-      }
-    } catch {
-      setError("Error fetching data. Please try again.");
-    } finally {
-      setLoading(false);
-    }
+    setQuery("");
+    setError("");
+    onSelect(equity);
   };
 
   return (
@@ -130,16 +109,9 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
       <div className="relative">
         {/* Search icon */}
         <div className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none">
-          {loading ? (
-            <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-            </svg>
-          ) : (
-            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" />
-            </svg>
-          )}
+          <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" />
+          </svg>
         </div>
 
         <input
@@ -148,7 +120,6 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
           value={query}
           onChange={handleInput}
           onKeyDown={handleKeyDown}
-          disabled={loading}
           placeholder={
             listLoading
               ? "Loading NSE stock list…"
@@ -156,13 +127,10 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
               ? "Stock list unavailable"
               : "Search by symbol or company name (e.g. TCS, RELIANCE, PAYTM)"
           }
-          className="w-full pl-12 pr-4 py-4 text-base border-2 border-gray-200 rounded-2xl shadow-sm focus:outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:bg-gray-50 disabled:cursor-not-allowed transition-all bg-white"
-          autoComplete="off"
-          aria-autocomplete="list"
-          aria-haspopup="listbox"
+          className="w-full pl-12 pr-4 py-4 text-base border-2 border-gray-200 rounded-2xl shadow-sm focus:outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100 transition-all bg-white"
         />
 
-        {query && !loading && (
+        {query && (
           <button
             onClick={() => { setQuery(""); setSuggestions([]); }}
             className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"

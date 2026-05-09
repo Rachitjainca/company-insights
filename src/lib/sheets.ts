@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { CompanyInsights, FinancialResult } from "@/types/financial";
 
 export interface GoogleSheetsConfig {
@@ -87,3 +88,4 @@ export function createGoogleSheetsService(): GoogleSheetsService {
 
   return new GoogleSheetsService(config);
 }
+

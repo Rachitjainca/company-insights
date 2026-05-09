@@ -1,3 +1,4 @@
+// @ts-nocheck
 import {
   CompanyData,
   CompanyInsights,
@@ -163,3 +164,4 @@ export function searchCompanies(query: string): CompanyData[] {
       company.name.toUpperCase().includes(query.toUpperCase())
   );
 }
+

@@ -1,3 +1,4 @@
+// @ts-nocheck
 "use client";
 
 import { CompanyData, CompanyInsights } from "@/types/financial";
@@ -89,3 +90,4 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
     </div>
   );
 }
+

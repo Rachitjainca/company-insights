@@ -2,20 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 
 interface ExportRequest {
   company: {
-    ticker: string;
+    symbol: string;
     name: string;
-    sector: string;
-    marketCap: string;
+    isin?: string;
   };
-  financialResults: Array<{
-    quarter: string;
-    year: number;
-    revenue: number;
-    netIncome: number;
-    eps: number;
-    roe: number;
-    roa: number;
-    debtToEquity: number;
+  documents: Array<{
+    category: string;
+    fiscalYear: string;
+    quarter?: string;
+    title: string;
+    url: string;
+    type: string;
   }>;
 }
 
@@ -90,60 +87,61 @@ async function createSpreadsheet(
 }
 
 /**
- * Append financial data to Google Sheet
+ * Append IR document rows to Google Sheet
  */
-async function appendFinancialData(
+async function appendDocumentRows(
   accessToken: string,
   spreadsheetId: string,
-  companyData: ExportRequest
+  data: ExportRequest
 ): Promise<boolean> {
   try {
+    const CATEGORY_LABELS: Record<string, string> = {
+      "quarterly-results": "Quarterly Results",
+      "investor-presentation": "Investor Presentation",
+      "concall": "Concall",
+      "annual-report": "Annual Report",
+      "kpi-handbook": "KPI Handbook",
+    };
+
     const headers = [
-      "Quarter",
-      "Year",
-      "Revenue (USD M)",
-      "Net Income (USD M)",
-      "EPS (₹)",
-      "ROE (%)",
-      "ROA (%)",
-      "Debt/Equity",
+      "Company",
+      "Ticker",
+      "Category",
+      "Period",
+      "Title",
+      "URL",
+      "Type",
     ];
 
-    const rows = companyData.financialResults.map((result) => [
-      result.quarter,
-      result.year.toString(),
-      result.revenue.toString(),
-      result.netIncome.toString(),
-      result.eps.toFixed(2),
-      result.roe.toFixed(2),
-      result.roa.toFixed(2),
-      result.debtToEquity.toFixed(2),
-    ]);
+    const rows = data.documents.map((doc) => {
+      const period = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" · ");
+      return [
+        data.company.name,
+        data.company.symbol,
+        CATEGORY_LABELS[doc.category] ?? doc.category,
+        period,
+        doc.title,
+        doc.url,
+        doc.type.toUpperCase(),
+      ];
+    });
 
     const values = [headers, ...rows];
 
     const response = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/'Financial Results'!A1:append?valueInputOption=USER_ENTERED`,
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Sheet1!A1:append?valueInputOption=USER_ENTERED`,
       {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          values: values,
-        }),
+        body: JSON.stringify({ values }),
       }
     );
 
-    if (!response.ok) {
-      console.error("Append data failed:", await response.text());
-      return false;
-    }
-
-    return true;
-  } catch (error) {
-    console.error("Error appending data:", error);
+    return response.ok;
+  } catch {
     return false;
   }
 }
@@ -196,15 +194,15 @@ export async function POST(request: NextRequest) {
     // Parse request body
     const companyData: ExportRequest = await request.json();
 
-    if (!companyData.company || !companyData.financialResults) {
+    if (!companyData.company || !Array.isArray(companyData.documents)) {
       return NextResponse.json(
-        { error: "Missing required company or financial data" },
+        { error: "Missing required company or documents data" },
         { status: 400 }
       );
     }
 
     // Create spreadsheet
-    const title = `${companyData.company.ticker} - Financial Data - ${new Date().toISOString().split('T')[0]}`;
+    const title = `${companyData.company.symbol} - IR Documents - ${new Date().toISOString().split("T")[0]}`;
     const spreadsheetId = await createSpreadsheet(token, title);
 
     if (!spreadsheetId) {
@@ -217,33 +215,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Add company information as first sheet
-    const companyInfoResponse = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/'Sheet1'!A1:append?valueInputOption=USER_ENTERED`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          values: [
-            ["Company Information"],
-            [""],
-            ["Field", "Value"],
-            ["Ticker", companyData.company.ticker],
-            ["Name", companyData.company.name],
-            ["Sector", companyData.company.sector],
-            ["Market Cap", companyData.company.marketCap],
-            [""],
-            ["Financial Results"],
-          ],
-        }),
-      }
-    );
-
-    // Append financial data
-    await appendFinancialData(token, spreadsheetId, companyData);
+    // Append document rows
+    await appendDocumentRows(token, spreadsheetId, companyData);
 
     // Make the sheet shareable
     const permissionResponse = await fetch(
@@ -268,7 +241,7 @@ export async function POST(request: NextRequest) {
         success: true,
         spreadsheetId,
         sheetUrl,
-        message: `Successfully created Google Sheet: ${title}`,
+        message: `Successfully exported ${companyData.documents.length} document${companyData.documents.length !== 1 ? "s" : ""} to Google Sheets`,
       },
       { status: 200 }
     );

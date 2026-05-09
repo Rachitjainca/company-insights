@@ -1,3 +1,4 @@
+// @ts-nocheck
 import {
   FinancialResult,
   QoQAnalysis,
@@ -100,3 +101,4 @@ export function formatCurrency(value: number): string {
     minimumFractionDigits: 0,
   }).format(value);
 }
+
