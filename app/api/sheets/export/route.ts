@@ -1,4 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
+import { parseQuarterlyXBRL, ORDERED_METRICS } from "@/lib/xbrl-parser";
+
+// NSE headers used when fetching XBRL files server-side
+const NSE_HEADERS: HeadersInit = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept: "application/xml, text/xml, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  Referer: "https://www.nseindia.com/",
+};
+
+interface ExportDocument {
+  category: string;
+  fiscalYear: string;
+  quarter?: string;
+  title: string;
+  url: string;
+  type: string;
+  xbrlUrl?: string;
+}
 
 interface ExportRequest {
   company: {
@@ -6,14 +26,10 @@ interface ExportRequest {
     name: string;
     isin?: string;
   };
-  documents: Array<{
-    category: string;
-    fiscalYear: string;
-    quarter?: string;
-    title: string;
-    url: string;
-    type: string;
-  }>;
+  documents: ExportDocument[];
+  /** "metadata" (default): one row per document with URL.
+   *  "xbrl": parse XBRL for quarterly-results docs and write financial metric columns. */
+  exportMode?: "metadata" | "xbrl";
 }
 
 /**
@@ -87,7 +103,7 @@ async function createSpreadsheet(
 }
 
 /**
- * Append IR document rows to Google Sheet
+ * Append IR document metadata rows to Google Sheet (one row per document).
  */
 async function appendDocumentRows(
   accessToken: string,
@@ -125,6 +141,86 @@ async function appendDocumentRows(
         doc.type.toUpperCase(),
       ];
     });
+
+    const values = [headers, ...rows];
+
+    const response = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Sheet1!A1:append?valueInputOption=USER_ENTERED`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ values }),
+      }
+    );
+
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Append XBRL financial data rows to Google Sheet (wide format).
+ * One row per quarterly filing; metrics are columns.
+ * Falls back to appending a metadata row for docs without a valid xbrlUrl.
+ */
+async function appendXBRLRows(
+  accessToken: string,
+  spreadsheetId: string,
+  data: ExportRequest
+): Promise<boolean> {
+  try {
+    // Header row
+    const headers = [
+      "Company",
+      "Ticker",
+      "Quarter",
+      "Fiscal Year",
+      "Type",
+      ...ORDERED_METRICS,
+    ];
+
+    // Only process quarterly-results docs; skip others for XBRL mode
+    const quarterlyDocs = data.documents.filter(
+      (d) => d.category === "quarterly-results"
+    );
+
+    const rows: (string | number | null)[][] = [];
+
+    for (const doc of quarterlyDocs) {
+      // Derive consolidated/standalone label from title
+      const consolidated = doc.title.includes("Consolidated")
+        ? "Consolidated"
+        : doc.title.includes("Non-Consolidated") || doc.title.includes("Standalone")
+        ? "Standalone"
+        : "";
+
+      if (doc.xbrlUrl) {
+        const metrics = await parseQuarterlyXBRL(doc.xbrlUrl, NSE_HEADERS);
+        const metricValues = ORDERED_METRICS.map((label) => metrics[label] ?? null);
+        rows.push([
+          data.company.name,
+          data.company.symbol,
+          doc.quarter ?? "",
+          doc.fiscalYear,
+          consolidated,
+          ...metricValues,
+        ]);
+      } else {
+        // No XBRL — write a row with nulls for metric columns
+        rows.push([
+          data.company.name,
+          data.company.symbol,
+          doc.quarter ?? "",
+          doc.fiscalYear,
+          consolidated,
+          ...ORDERED_METRICS.map(() => null),
+        ]);
+      }
+    }
 
     const values = [headers, ...rows];
 
@@ -202,7 +298,8 @@ export async function POST(request: NextRequest) {
     }
 
     // Create spreadsheet
-    const title = `${companyData.company.symbol} - IR Documents - ${new Date().toISOString().split("T")[0]}`;
+    const modeLabel = companyData.exportMode === "xbrl" ? "XBRL Financials" : "IR Documents";
+    const title = `${companyData.company.symbol} - ${modeLabel} - ${new Date().toISOString().split("T")[0]}`;
     const spreadsheetId = await createSpreadsheet(token, title);
 
     if (!spreadsheetId) {
@@ -215,8 +312,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Append document rows
-    await appendDocumentRows(token, spreadsheetId, companyData);
+    // Append document rows (metadata or XBRL mode)
+    if (companyData.exportMode === "xbrl") {
+      await appendXBRLRows(token, spreadsheetId, companyData);
+    } else {
+      await appendDocumentRows(token, spreadsheetId, companyData);
+    }
 
     // Make the sheet shareable
     const permissionResponse = await fetch(

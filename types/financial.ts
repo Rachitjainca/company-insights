@@ -22,6 +22,8 @@ export interface IRDocument {
   title: string;
   url: string;
   type: DocumentLinkType;
+  /** XBRL XML download URL, when available from NSE */
+  xbrlUrl?: string;
 }
 
 export interface SelectedDoc extends IRDocument {

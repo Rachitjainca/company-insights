@@ -15,6 +15,12 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
   const [message, setMessage] = useState("");
   const [sheetUrl, setSheetUrl] = useState("");
   const [showSuccess, setShowSuccess] = useState(false);
+  const [xbrlMode, setXbrlMode] = useState(false);
+
+  // Whether any selected doc has an XBRL URL and is a quarterly result
+  const hasXbrlDocs = selectedDocs.some(
+    (d) => d.xbrlUrl && d.category === "quarterly-results"
+  );
 
   useEffect(() => {
     if (!message) return;
@@ -32,7 +38,11 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
     }
 
     try {
-      const result = await exportToSheets({ company, documents: selectedDocs });
+      const result = await exportToSheets({
+        company,
+        documents: selectedDocs,
+        exportMode: xbrlMode ? "xbrl" : "metadata",
+      });
       if (result.success) {
         setSheetUrl(result.sheetUrl ?? "");
         setMessage(`✓ ${result.message}`);
@@ -54,6 +64,25 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
           : `${selectedDocs.length} document${selectedDocs.length !== 1 ? "s" : ""} selected.`}
       </p>
 
+      {/* XBRL mode toggle — only shown when quarterly results with XBRL are selected */}
+      {hasXbrlDocs && (
+        <label className="flex items-start gap-2 mb-4 cursor-pointer group">
+          <input
+            type="checkbox"
+            checked={xbrlMode}
+            onChange={(e) => setXbrlMode(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+          />
+          <span className="text-sm text-gray-700 group-hover:text-gray-900 leading-snug">
+            <span className="font-medium">Export XBRL financial data</span>
+            <span className="block text-xs text-gray-400 mt-0.5">
+              Parse Regulation 33 Ind-AS XBRL files and write structured financial metrics as columns
+              (Revenue, PAT, EPS, etc.) instead of document URLs.
+            </span>
+          </span>
+        </label>
+      )}
+
       <button
         onClick={handleExport}
         disabled={disabled}
@@ -69,7 +98,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
             {isAuthenticated ? "Creating Sheet…" : "Authorising…"}
           </>
         ) : isAuthenticated ? (
-          <>📊 Export to Google Sheets</>
+          <>{xbrlMode ? "📊 Export XBRL to Sheets" : "📊 Export to Google Sheets"}</>
         ) : (
           <>🔑 Connect Google Sheets</>
         )}

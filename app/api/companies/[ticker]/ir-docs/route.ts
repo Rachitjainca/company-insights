@@ -2,7 +2,9 @@
 //
 // Hybrid endpoint: merges results from:
 //  1. Custom per-company IR scrapers (CompanyDocumentsBundle) when registered
-//  2. BSE India filings API (broad coverage for all listed companies)
+//  2. NSE India API  — quarterly results (with XBRL) + annual reports (with XBRL)
+//  3. BSE India filings API — investor presentations, concalls, KPI handbooks only
+//     (BSE quarterly-results and annual-reports are dropped; NSE is authoritative)
 //
 // Returns IRDocument[] grouped under 5 categories:
 //   quarterly-results | investor-presentation | concall | annual-report | kpi-handbook
@@ -10,6 +12,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getScraper } from "@/lib/scrapers/registry";
 import { lookupBSECode, fetchBSEFilings } from "@/lib/bse-filings";
+import { fetchNSEQuarterlyResults, fetchNSEAnnualReports } from "@/lib/nse-filings";
 import type { IRCategory, IRDocument } from "@/types/financial";
 import type { CompanyDocumentsBundle } from "@/lib/scrapers/types";
 
@@ -88,33 +91,50 @@ export async function GET(
   const { ticker } = await params;
   const upperTicker = ticker.toUpperCase();
 
-  // Run scraper + BSE lookup in parallel
-  const [scraperResult, bseCode] = await Promise.allSettled([
-    (async () => {
-      const scraper = getScraper(upperTicker);
-      if (!scraper) return null;
-      return scraper.fetchDocuments();
-    })(),
-    lookupBSECode(upperTicker),
-  ]);
+  // Run all data sources in parallel
+  const [scraperResult, nseQuarterlyResult, nseAnnualResult, bseCode] =
+    await Promise.allSettled([
+      (async () => {
+        const scraper = getScraper(upperTicker);
+        if (!scraper) return null;
+        return scraper.fetchDocuments();
+      })(),
+      fetchNSEQuarterlyResults(upperTicker),
+      fetchNSEAnnualReports(upperTicker),
+      lookupBSECode(upperTicker),
+    ]);
 
   const docs: IRDocument[] = [];
   let companyName = upperTicker;
 
-  // 1. Scraper results
+  // 1. Custom scraper results (highest priority — company-specific)
   if (scraperResult.status === "fulfilled" && scraperResult.value) {
     const bundle = scraperResult.value;
     companyName = bundle.companyName || companyName;
     docs.push(...bundleToIRDocs(bundle));
   }
 
-  // 2. BSE filings
-  const bseCodeValue =
-    bseCode.status === "fulfilled" ? bseCode.value : null;
+  // 2. NSE quarterly results (authoritative for quarterly-results category)
+  if (nseQuarterlyResult.status === "fulfilled") {
+    docs.push(...nseQuarterlyResult.value);
+  }
 
+  // 3. NSE annual reports (authoritative for annual-report category)
+  if (nseAnnualResult.status === "fulfilled") {
+    docs.push(...nseAnnualResult.value);
+  }
+
+  // 4. BSE filings — only keep investor-presentation, concall, kpi-handbook.
+  //    NSE is now authoritative for quarterly-results and annual-report.
+  const bseCodeValue = bseCode.status === "fulfilled" ? bseCode.value : null;
   if (bseCodeValue) {
     const bseDocs = await fetchBSEFilings(bseCodeValue);
-    docs.push(...bseDocs);
+    const bseCategoriesToKeep = new Set<IRCategory>([
+      "investor-presentation",
+      "concall",
+      "kpi-handbook",
+    ]);
+    docs.push(...bseDocs.filter((d) => bseCategoriesToKeep.has(d.category)));
   }
 
   const dedupedDocs = dedup(docs);
