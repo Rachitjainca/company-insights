@@ -85,8 +85,40 @@ function dedup(docs: IRDocument[]): IRDocument[] {
   });
 }
 
+/**
+ * Normalize mixed URL formats into an absolute, valid URL string.
+ * Returns null for unparseable or unsupported URL shapes.
+ */
+function normalizeDocUrl(rawUrl: string, requestUrl: string): string | null {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+
+  try {
+    // Absolute HTTP(S) URL
+    if (/^https?:\/\//i.test(trimmed)) {
+      return new URL(trimmed).toString();
+    }
+    // Protocol-relative URL: //example.com/file.pdf
+    if (trimmed.startsWith("//")) {
+      return new URL(`https:${trimmed}`).toString();
+    }
+    // Relative app URL: /api/bse-doc?name=...
+    if (trimmed.startsWith("/")) {
+      return new URL(trimmed, requestUrl).toString();
+    }
+    // Bare host/path URL: example.com/file.pdf
+    if (/^[a-z0-9.-]+\.[a-z]{2,}([/:?#]|$)/i.test(trimmed)) {
+      return new URL(`https://${trimmed}`).toString();
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ ticker: string }> }
 ) {
   const { ticker } = await params;
@@ -150,7 +182,16 @@ export async function GET(
     }
   }
 
-  const dedupedDocs = dedup(docs);
+  // Ensure API output always carries valid absolute URLs.
+  const normalizedDocs = docs
+    .map((doc) => {
+      const normalizedUrl = normalizeDocUrl(doc.url, request.url);
+      if (!normalizedUrl) return null;
+      return { ...doc, url: normalizedUrl };
+    })
+    .filter((d): d is IRDocument => d !== null);
+
+  const dedupedDocs = dedup(normalizedDocs);
 
   // Group by category for the response (makes UI rendering easier)
   const grouped: Record<IRCategory, IRDocument[]> = {
