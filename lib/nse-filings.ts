@@ -317,18 +317,23 @@ export async function fetchNSEAnnualReports(symbol: string): Promise<IRDocument[
 // ─── NSE Corporate Announcements ─────────────────────────────────────────────
 //
 // NSE lists investor presentations and concall transcripts under
-// /api/corporates-announcements.  Requires the same session cookie preflight
+// /api/corporate-announcements.  Requires the same session cookie preflight
 // as the other NSE APIs.  Returns [] gracefully if API is unavailable.
 
 interface NSEAnnouncement {
   symbol?: string;
-  subject?: string;
-  an_dt?: string;          // date string e.g. "14-Jan-2025"
-  attachmentFile?: string; // absolute PDF URL
   desc?: string;
-  pdate?: string;          // alternate date field
-  attchmnt?: string;       // alternate attachment field
+  attchmntText?: string;
+  an_dt?: string;          // date string e.g. "14-Jan-2025"
+  attchmntFile?: string;   // absolute PDF URL
+  // Keep older field names as optional fallbacks for compatibility.
+  subject?: string;
+  attachmentFile?: string;
+  pdate?: string;
+  attchmnt?: string;
 }
+
+const ANNOUNCEMENT_LIMIT = 120;
 
 // Keyword patterns for announcement subject classification
 const NSE_PRES_RE = /investor\s+presentation|analyst\s+(meet|day|briefing)|earnings\s+presentation|roadshow|business\s+update|earnings\s+update|\bpresentation\b/i;
@@ -356,7 +361,7 @@ export async function fetchNSEAnnouncements(symbol: string): Promise<IRDocument[
     const fromDate = `01-01-${now.getFullYear() - 3}`;
 
     const url =
-      `https://www.nseindia.com/api/corporates-announcements` +
+      `https://www.nseindia.com/api/corporate-announcements` +
       `?index=equities&symbol=${encodeURIComponent(symbol)}` +
       `&from_date=${encodeURIComponent(fromDate)}&to_date=${encodeURIComponent(toDate)}`;
 
@@ -371,8 +376,10 @@ export async function fetchNSEAnnouncements(symbol: string): Promise<IRDocument[
 
     const docs: IRDocument[] = [];
     for (const row of data) {
-      const subject = row.subject ?? "";
-      const fileUrl = row.attachmentFile ?? row.attchmnt ?? "";
+      if (docs.length >= ANNOUNCEMENT_LIMIT) break;
+
+      const subject = (row.desc ?? row.attchmntText ?? row.subject ?? "").trim();
+      const fileUrl = row.attchmntFile ?? row.attachmentFile ?? row.attchmnt ?? "";
       if (!fileUrl || !fileUrl.startsWith("https://")) continue;
 
       let category: IRCategory | null = null;
