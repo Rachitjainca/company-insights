@@ -320,7 +320,7 @@ export async function fetchNSEAnnualReports(symbol: string): Promise<IRDocument[
 // /api/corporate-announcements.  Requires the same session cookie preflight
 // as the other NSE APIs.  Returns [] gracefully if API is unavailable.
 
-interface NSEAnnouncement {
+export interface NSEAnnouncement {
   symbol?: string;
   desc?: string;
   attchmntText?: string;
@@ -344,6 +344,41 @@ function parseAnnounceDate(raw: NSEAnnouncement): string {
   // "14-Jan-2025" → extract year
   const m = s.match(/(\d{4})/);
   return m ? `FY${m[1]}` : "N/A";
+}
+
+/**
+ * Map raw NSE announcement rows to IR documents.
+ * Exported so QA routes can validate classification using mocked payloads.
+ */
+export function mapNSEAnnouncementsToIRDocs(
+  rows: NSEAnnouncement[],
+  limit = ANNOUNCEMENT_LIMIT
+): IRDocument[] {
+  const docs: IRDocument[] = [];
+
+  for (const row of rows) {
+    if (docs.length >= limit) break;
+
+    const subject = (row.desc ?? row.attchmntText ?? row.subject ?? "").trim();
+    const fileUrl = row.attchmntFile ?? row.attachmentFile ?? row.attchmnt ?? "";
+    if (!fileUrl || !fileUrl.startsWith("https://")) continue;
+
+    let category: IRCategory | null = null;
+    if (NSE_CONCALL_RE.test(subject)) category = "concall";
+    else if (NSE_PRES_RE.test(subject)) category = "investor-presentation";
+    if (!category) continue;
+
+    docs.push({
+      category,
+      fiscalYear: parseAnnounceDate(row),
+      title: subject || fileUrl.split("/").pop() || "NSE Document",
+      url: fileUrl,
+      type: detectType(fileUrl),
+      source: "nse",
+    });
+  }
+
+  return docs;
 }
 
 /**
@@ -374,29 +409,7 @@ export async function fetchNSEAnnouncements(symbol: string): Promise<IRDocument[
     const data: NSEAnnouncement[] = JSON.parse(text);
     if (!Array.isArray(data)) return [];
 
-    const docs: IRDocument[] = [];
-    for (const row of data) {
-      if (docs.length >= ANNOUNCEMENT_LIMIT) break;
-
-      const subject = (row.desc ?? row.attchmntText ?? row.subject ?? "").trim();
-      const fileUrl = row.attchmntFile ?? row.attachmentFile ?? row.attchmnt ?? "";
-      if (!fileUrl || !fileUrl.startsWith("https://")) continue;
-
-      let category: IRCategory | null = null;
-      if (NSE_CONCALL_RE.test(subject)) category = "concall";
-      else if (NSE_PRES_RE.test(subject)) category = "investor-presentation";
-      if (!category) continue;
-
-      docs.push({
-        category,
-        fiscalYear: parseAnnounceDate(row),
-        title: subject.trim() || fileUrl.split("/").pop() || "NSE Document",
-        url: fileUrl,
-        type: detectType(fileUrl),
-        source: "nse",
-      });
-    }
-    return docs;
+    return mapNSEAnnouncementsToIRDocs(data);
   } catch {
     return [];
   }
