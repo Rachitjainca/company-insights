@@ -49,7 +49,7 @@ export default function Home() {
             rel="noopener noreferrer"
             className="text-xs text-gray-400 hover:text-gray-600 transition-colors hidden sm:block"
           >
-            Data: NSE India
+            Data: NSE/BSE
           </a>
         </div>
       </header>
@@ -61,14 +61,14 @@ export default function Home() {
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 text-center">
               <div className="inline-flex items-center gap-2 bg-white/20 text-white text-xs font-semibold px-3 py-1 rounded-full mb-6">
                 <span className="w-2 h-2 bg-green-300 rounded-full animate-pulse" />
-                Live NSE + BSE data
+                Live NSE/BSE data
               </div>
               <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight mb-4">
-                NSE Investor Relations,
+                NSE/BSE Investor Relations,
                 <br className="hidden sm:block" /> in one place.
               </h1>
               <p className="text-blue-100 text-lg mb-8 max-w-2xl mx-auto">
-                Search any NSE-listed company to instantly access IR documents across 5 categories
+                Search any NSE/BSE-listed company to instantly access IR documents across 5 categories
                 — then export to Google Sheets with one click.
               </p>
               <CompanySearch onSelect={handleSelect} />
@@ -150,7 +150,7 @@ export default function Home() {
               target="_blank"
               rel="noopener noreferrer"
             >
-              NSE India
+              NSE/BSE
             </a>
             , updated daily.
           </span>
