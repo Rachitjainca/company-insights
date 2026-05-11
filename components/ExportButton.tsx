@@ -64,8 +64,6 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
   const [sheetUrl, setSheetUrl] = useState("");
   const [showSuccess, setShowSuccess] = useState(false);
   const [xbrlMode, setXbrlMode] = useState(false);
-  const [includeContent, setIncludeContent] = useState(true);
-  const [createGoogleDocs, setCreateGoogleDocs] = useState(true);
 
   // Whether any selected doc has an XBRL URL and is a quarterly result
   const hasXbrlDocs = selectedDocs.some(
@@ -78,16 +76,8 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
     return () => clearTimeout(t);
   }, [message]);
 
-  useEffect(() => {
-    // Guard against stale toggle state when selection changes.
-    if (!hasXbrlDocs && xbrlMode) setXbrlMode(false);
-  }, [hasXbrlDocs, xbrlMode]);
-
-  useEffect(() => {
-    if (!includeContent && createGoogleDocs) {
-      setCreateGoogleDocs(false);
-    }
-  }, [includeContent, createGoogleDocs]);
+  // Derive a safe mode so stale toggle state cannot leak into requests.
+  const effectiveXbrlMode = hasXbrlDocs ? xbrlMode : false;
 
   const handleExport = async () => {
     setMessage("");
@@ -102,9 +92,8 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
       const result = await exportToSheets({
         company,
         documents: selectedDocs,
-        exportMode: xbrlMode ? "xbrl" : "metadata",
-        includeContent,
-        createGoogleDocs,
+        exportMode: effectiveXbrlMode ? "xbrl" : "metadata",
+        createGoogleDocs: true,
       });
       if (result.success) {
         setSheetUrl(result.sheetUrl ?? "");
@@ -147,21 +136,11 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
               description="Parse Reg 33 Ind-AS XBRL files — writes Revenue, PAT, EPS and other metrics as columns instead of document links."
             />
           )}
-          {!xbrlMode && (
-            <ToggleCard
-              checked={includeContent}
-              onChange={setIncludeContent}
-              label="Include file content (not just URLs)"
-              description="Extracts text from each selected file (HTML/XML/TXT) and writes it into the sheet."
-            />
-          )}
-          {!xbrlMode && includeContent && (
-            <ToggleCard
-              checked={createGoogleDocs}
-              onChange={setCreateGoogleDocs}
-              label="Also create a Google Doc per file"
-              description="Stores full extracted text in separate Google Docs and adds the doc links in your sheet."
-            />
+          {!effectiveXbrlMode && (
+            <div className="px-3.5 py-3 rounded-xl border border-gray-200 bg-gray-50 text-xs text-gray-600 leading-relaxed">
+              Metadata export writes only links in the sheet: source file URL + Google Doc URL.
+              The Google Doc is populated with financial and key KPI tables when available.
+            </div>
           )}
         </div>
       )}
@@ -187,7 +166,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
             </svg>
             Connect Google Sheets
           </>
-        ) : xbrlMode ? (
+        ) : effectiveXbrlMode ? (
           <>
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
@@ -199,7 +178,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
-            {includeContent ? "Export with Content to Sheets" : "Export Links to Sheets"}
+            Export Links + Docs to Sheets
           </>
         )}
       </button>

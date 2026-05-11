@@ -1,4 +1,3 @@
-// @ts-nocheck
 "use client";
 
 import { CompanyInsights } from "@/types/financial";

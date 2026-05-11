@@ -24,7 +24,6 @@ interface IRDocsResponse {
 
 interface CompanyDocumentsProps {
   ticker: string;
-  companyName: string;
   onSelectionChange: (selected: SelectedDoc[]) => void;
 }
 
@@ -327,17 +326,14 @@ function SourceBadge({ label, ok }: { label: string; ok: boolean }) {
 
 export default function CompanyDocuments({
   ticker,
-  companyName,
   onSelectionChange,
 }: CompanyDocumentsProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
   const [sourceFilter, setSourceFilter] = useState<"all" | IRSource>("all");
 
-  const load = useCallback(() => {
+  const fetchDocs = useCallback(() => {
     let cancelled = false;
-    setState({ status: "loading" });
-    setCheckedKeys(new Set());
 
     fetch(`/api/companies/${encodeURIComponent(ticker)}/ir-docs`, { cache: "no-store" })
       .then(async (res) => {
@@ -356,9 +352,15 @@ export default function CompanyDocuments({
     return () => { cancelled = true; };
   }, [ticker]);
 
+  const load = useCallback(() => {
+    setState({ status: "loading" });
+    setCheckedKeys(new Set());
+    void fetchDocs();
+  }, [fetchDocs]);
+
   useEffect(() => {
-    return load();
-  }, [load]);
+    return fetchDocs();
+  }, [fetchDocs]);
 
   useEffect(() => {
     if (state.status !== "ready") return;

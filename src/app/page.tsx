@@ -1,12 +1,11 @@
-// @ts-nocheck
 "use client";
 
 import { useState } from "react";
-import CompanySearch from "@/components/CompanySearch";
-import FinancialResults from "@/components/FinancialResults";
-import Analysis from "@/components/Analysis";
-import ExportButton from "@/components/ExportButton";
-import { CompanyInsights } from "@/types/financial";
+import CompanySearch from "../components/CompanySearch";
+import FinancialResults from "../components/FinancialResults";
+import Analysis from "../components/Analysis";
+import ExportButton from "../components/ExportButton";
+import { CompanyInsights } from "../types/financial";
 
 export default function Home() {
   const [selectedInsights, setSelectedInsights] =

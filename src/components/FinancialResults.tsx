@@ -1,8 +1,7 @@
-// @ts-nocheck
 "use client";
 
 import { CompanyInsights, FinancialResult } from "@/types/financial";
-import { formatCurrency, formatPercentage } from "@/lib/analysis";
+import { formatCurrency } from "@/lib/analysis";
 
 interface FinancialResultsProps {
   insights: CompanyInsights;

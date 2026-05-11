@@ -27,6 +27,77 @@ interface NSEFinancialResult {
   seqNumber?: string;
 }
 
+interface NSEIntegratedFilingResult {
+  seq_Id?: string;
+  symbol?: string;
+  smName?: string;
+  cmName?: string;
+  type?: string;
+  qe_Date?: string;       // "31-MAR-2026"
+  ixbrl?: string;         // details HTML (human-readable)
+  type_Sub?: string;      // "Original" | "Revised"
+  pdf_attach?: string;
+  xbrl?: string;          // XBRL XML
+  broadcast_Date?: string;
+  revised_Date?: string | null;
+  revision_Remark?: string | null;
+  audited?: string;       // "Audited" | "Un-Audited"
+  consolidated?: string;  // "Consolidated" | "Standalone"
+}
+
+interface NSEIntegratedFilingResponse {
+  data?: NSEIntegratedFilingResult[];
+  size?: number;
+  page?: number;
+  totalCount?: number;
+}
+
+interface IntegratedFilingFetchResult {
+  ok: boolean;
+  status: number | null;
+  rows: NSEIntegratedFilingResult[];
+  totalCount: number;
+  error?: string;
+}
+
+export interface NSEIntegratedQuarterlyLastSuccessMeta {
+  checkedAt: string;
+  symbol: string;
+  status: number;
+  totalCount: number;
+  rowsReceived: number;
+  mar2025Rows: number;
+  docsGenerated: number;
+  latestQuarterEnd: string | null;
+  oldestQuarterEnd: string | null;
+}
+
+export interface NSEIntegratedQuarterlyHealthReport {
+  ok: boolean;
+  checkedAt: string;
+  symbol: string;
+  endpoint: string;
+  query: {
+    type: string;
+    page: number;
+    size: number;
+  };
+  upstream: {
+    ok: boolean;
+    status: number | null;
+    totalCount: number;
+    rowsReceived: number;
+    error?: string;
+  };
+  transformed: {
+    mar2025Rows: number;
+    docsGenerated: number;
+    latestQuarterEnd: string | null;
+    oldestQuarterEnd: string | null;
+  };
+  lastSuccess: NSEIntegratedQuarterlyLastSuccessMeta | null;
+}
+
 interface NSEAnnualReport {
   companyName: string;
   fromYr: string;         // "2024"
@@ -101,8 +172,16 @@ async function getNSECookie(): Promise<string> {
 }
 
 // Maximum number of quarterly results to return (newest first).
-// 40 results ≈ 5 years of Consolidated + Non-Consolidated pairs per quarter.
+// 40 results ≈ 5 years of Consolidated + Standalone pairs per quarter.
 const QUARTERLY_RESULT_LIMIT = 40;
+const INTEGRATED_FILING_TYPE = "Integrated Filing- Financials";
+const INTEGRATED_MIN_DATE_UTC = Date.UTC(2025, 2, 1); // 01-Mar-2025
+const INTEGRATED_FILING_ENDPOINT = "https://www.nseindia.com/api/integrated-filing-results";
+const INTEGRATED_FETCH_PAGE = 1;
+const INTEGRATED_FETCH_SIZE = 200;
+
+let nseIntegratedQuarterlyLastSuccess: NSEIntegratedQuarterlyLastSuccessMeta | null =
+  null;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +223,66 @@ function parseFiscalYear(financialYear: string): string {
   return financialYear;
 }
 
+function parseQuarterEndDate(raw: string): Date | null {
+  const m = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+  if (!m) return null;
+
+  const day = Number(m[1]);
+  const mon = m[2].toUpperCase();
+  const year = Number(m[3]);
+
+  const monthByCode: Record<string, number> = {
+    JAN: 0,
+    FEB: 1,
+    MAR: 2,
+    APR: 3,
+    MAY: 4,
+    JUN: 5,
+    JUL: 6,
+    AUG: 7,
+    SEP: 8,
+    OCT: 9,
+    NOV: 10,
+    DEC: 11,
+  };
+
+  const month = monthByCode[mon];
+  if (month === undefined) return null;
+  return new Date(Date.UTC(year, month, day));
+}
+
+function isOnOrAfterIntegratedMinDate(rawQuarterEnd: string): boolean {
+  const parsed = parseQuarterEndDate(rawQuarterEnd);
+  if (!parsed) return false;
+  return parsed.getTime() >= INTEGRATED_MIN_DATE_UTC;
+}
+
+function quarterAndFiscalYearFromQuarterEnd(
+  rawQuarterEnd: string
+): { quarter?: string; fiscalYear: string } {
+  const parsed = parseQuarterEndDate(rawQuarterEnd);
+  if (!parsed) return { fiscalYear: "N/A" };
+
+  const month = parsed.getUTCMonth();
+  const year = parsed.getUTCFullYear();
+
+  if (month === 2) return { quarter: "Q4", fiscalYear: `FY${year}` };
+  if (month === 5) return { quarter: "Q1", fiscalYear: `FY${year + 1}` };
+  if (month === 8) return { quarter: "Q2", fiscalYear: `FY${year + 1}` };
+  if (month === 11) return { quarter: "Q3", fiscalYear: `FY${year + 1}` };
+
+  // Fallback for non-quarter-end dates (rare in this feed).
+  const fy = month <= 2 ? year : year + 1;
+  return { fiscalYear: `FY${fy}` };
+}
+
+function isValidDetailsUrl(url: string | undefined): boolean {
+  if (!url || url === "-") return false;
+  if (!url.startsWith("https://")) return false;
+  if (url.endsWith("/null")) return false;
+  return true;
+}
+
 function detectType(fileName: string): DocumentLinkType {
   const f = (fileName ?? "").toLowerCase();
   if (f.endsWith(".pdf")) return "pdf";
@@ -160,6 +299,136 @@ function buildQuarterlyFallbackUrl(symbol: string, row: NSEFinancialResult): str
   );
 }
 
+function buildIntegratedFilingUrl(symbol: string, page: number, size: number): string {
+  const params = new URLSearchParams({
+    type: INTEGRATED_FILING_TYPE,
+    symbol,
+    page: String(page),
+    size: String(size),
+  });
+  return `${INTEGRATED_FILING_ENDPOINT}?${params.toString()}`;
+}
+
+async function fetchNSEIntegratedFilingRows(
+  symbol: string,
+  page = INTEGRATED_FETCH_PAGE,
+  size = INTEGRATED_FETCH_SIZE
+): Promise<IntegratedFilingFetchResult> {
+  const endpoint = buildIntegratedFilingUrl(symbol, page, size);
+
+  try {
+    const cookie = await getNSECookie();
+    const res = await fetch(endpoint, {
+      headers: { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) },
+      next: { revalidate: 3600 },
+    });
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        rows: [],
+        totalCount: 0,
+        error: `http-${res.status}`,
+      };
+    }
+
+    const text = await res.text();
+    if (!text.trimStart().startsWith("{")) {
+      return {
+        ok: false,
+        status: res.status,
+        rows: [],
+        totalCount: 0,
+        error: "non-json-response",
+      };
+    }
+
+    const payload: NSEIntegratedFilingResponse = JSON.parse(text);
+    const rows = Array.isArray(payload.data) ? payload.data : [];
+
+    return {
+      ok: true,
+      status: res.status,
+      rows,
+      totalCount:
+        typeof payload.totalCount === "number" ? payload.totalCount : rows.length,
+    };
+  } catch {
+    return {
+      ok: false,
+      status: null,
+      rows: [],
+      totalCount: 0,
+      error: "fetch-error",
+    };
+  }
+}
+
+function summarizeQuarterEnds(
+  rows: NSEIntegratedFilingResult[]
+): { latestQuarterEnd: string | null; oldestQuarterEnd: string | null } {
+  const dated = rows
+    .filter((row) => !!row.qe_Date && isOnOrAfterIntegratedMinDate(row.qe_Date))
+    .map((row) => ({
+      qeDate: row.qe_Date!,
+      ts: parseQuarterEndDate(row.qe_Date!)?.getTime() ?? -1,
+    }))
+    .filter((d) => d.ts >= 0)
+    .sort((a, b) => b.ts - a.ts);
+
+  if (dated.length === 0) {
+    return {
+      latestQuarterEnd: null,
+      oldestQuarterEnd: null,
+    };
+  }
+
+  return {
+    latestQuarterEnd: dated[0].qeDate,
+    oldestQuarterEnd: dated[dated.length - 1].qeDate,
+  };
+}
+
+function mapIntegratedRowsToQuarterlyDocs(
+  rows: NSEIntegratedFilingResult[],
+  limit = QUARTERLY_RESULT_LIMIT
+): IRDocument[] {
+  const docs: IRDocument[] = [];
+
+  for (const row of rows) {
+    if (docs.length >= limit) break;
+    if (!row.qe_Date || !isOnOrAfterIntegratedMinDate(row.qe_Date)) continue;
+
+    const { quarter, fiscalYear } = quarterAndFiscalYearFromQuarterEnd(row.qe_Date);
+    const consolidated =
+      row.consolidated === "Consolidated" ? "Consolidated" : "Standalone";
+    const audited = row.audited ?? "Audited/Un-Audited";
+
+    const xbrlValid = isValidXbrlUrl(row.xbrl ?? "");
+    const detailsValid = isValidDetailsUrl(row.ixbrl);
+    const displayUrl = detailsValid
+      ? row.ixbrl!
+      : xbrlValid
+      ? row.xbrl!
+      : "https://www.nseindia.com/companies-listing/corporate-integrated-filing";
+
+    docs.push({
+      category: "quarterly-results" as IRCategory,
+      fiscalYear,
+      quarter,
+      title: `${quarter ?? row.qe_Date} ${fiscalYear} — ${consolidated} — ${audited}`,
+      // Details link (iXBRL HTML) is the primary click target; xbrlUrl holds XML.
+      url: displayUrl,
+      type: "other",
+      xbrlUrl: xbrlValid ? row.xbrl : undefined,
+      source: "nse",
+    });
+  }
+
+  return docs;
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -172,6 +441,102 @@ function buildQuarterlyFallbackUrl(symbol: string, row: NSEFinancialResult): str
  * `xbrlUrl` always carries the XBRL XML link when available.
  */
 export async function fetchNSEQuarterlyResults(symbol: string): Promise<IRDocument[]> {
+  const integratedDocs = await fetchNSEQuarterlyResultsIntegrated(symbol);
+  if (integratedDocs.length > 0) return integratedDocs;
+  return fetchNSEQuarterlyResultsLegacy(symbol);
+}
+
+export async function probeNSEIntegratedQuarterlyHealth(
+  symbol: string
+): Promise<NSEIntegratedQuarterlyHealthReport> {
+  const checkedAt = new Date().toISOString();
+  const normalizedSymbol = symbol.toUpperCase().trim();
+
+  const raw = await fetchNSEIntegratedFilingRows(
+    normalizedSymbol,
+    INTEGRATED_FETCH_PAGE,
+    INTEGRATED_FETCH_SIZE
+  );
+
+  const mar2025Rows = raw.rows.filter(
+    (row) => !!row.qe_Date && isOnOrAfterIntegratedMinDate(row.qe_Date)
+  ).length;
+  const docs = mapIntegratedRowsToQuarterlyDocs(raw.rows, QUARTERLY_RESULT_LIMIT);
+  const quarterRange = summarizeQuarterEnds(raw.rows);
+
+  if (raw.ok && raw.status !== null && raw.rows.length > 0) {
+    nseIntegratedQuarterlyLastSuccess = {
+      checkedAt,
+      symbol: normalizedSymbol,
+      status: raw.status,
+      totalCount: raw.totalCount,
+      rowsReceived: raw.rows.length,
+      mar2025Rows,
+      docsGenerated: docs.length,
+      latestQuarterEnd: quarterRange.latestQuarterEnd,
+      oldestQuarterEnd: quarterRange.oldestQuarterEnd,
+    };
+  }
+
+  return {
+    ok: raw.ok && mar2025Rows > 0 && docs.length > 0,
+    checkedAt,
+    symbol: normalizedSymbol,
+    endpoint: INTEGRATED_FILING_ENDPOINT,
+    query: {
+      type: INTEGRATED_FILING_TYPE,
+      page: INTEGRATED_FETCH_PAGE,
+      size: INTEGRATED_FETCH_SIZE,
+    },
+    upstream: {
+      ok: raw.ok,
+      status: raw.status,
+      totalCount: raw.totalCount,
+      rowsReceived: raw.rows.length,
+      ...(raw.error ? { error: raw.error } : {}),
+    },
+    transformed: {
+      mar2025Rows,
+      docsGenerated: docs.length,
+      latestQuarterEnd: quarterRange.latestQuarterEnd,
+      oldestQuarterEnd: quarterRange.oldestQuarterEnd,
+    },
+    lastSuccess: nseIntegratedQuarterlyLastSuccess,
+  };
+}
+
+async function fetchNSEQuarterlyResultsIntegrated(symbol: string): Promise<IRDocument[]> {
+  const raw = await fetchNSEIntegratedFilingRows(
+    symbol,
+    INTEGRATED_FETCH_PAGE,
+    INTEGRATED_FETCH_SIZE
+  );
+  if (!raw.ok || raw.rows.length === 0) return [];
+
+  const docs = mapIntegratedRowsToQuarterlyDocs(raw.rows, QUARTERLY_RESULT_LIMIT);
+  const mar2025Rows = raw.rows.filter(
+    (row) => !!row.qe_Date && isOnOrAfterIntegratedMinDate(row.qe_Date)
+  ).length;
+  const quarterRange = summarizeQuarterEnds(raw.rows);
+
+  if (raw.status !== null && docs.length > 0) {
+    nseIntegratedQuarterlyLastSuccess = {
+      checkedAt: new Date().toISOString(),
+      symbol: symbol.toUpperCase(),
+      status: raw.status,
+      totalCount: raw.totalCount,
+      rowsReceived: raw.rows.length,
+      mar2025Rows,
+      docsGenerated: docs.length,
+      latestQuarterEnd: quarterRange.latestQuarterEnd,
+      oldestQuarterEnd: quarterRange.oldestQuarterEnd,
+    };
+  }
+
+  return docs;
+}
+
+async function fetchNSEQuarterlyResultsLegacy(symbol: string): Promise<IRDocument[]> {
   try {
     const url =
       `https://www.nseindia.com/api/corporates-financial-results` +
@@ -196,6 +561,7 @@ export async function fetchNSEQuarterlyResults(symbol: string): Promise<IRDocume
     for (const row of data) {
       // Only quarterly; skip half-yearly and annual from this endpoint
       if (row.period !== "Quarterly") continue;
+      if (!isOnOrAfterIntegratedMinDate(row.toDate)) continue;
       if (docs.length >= QUARTERLY_RESULT_LIMIT) break;
 
       const quarter = relatingToQuarter(row.relatingTo);
@@ -207,14 +573,14 @@ export async function fetchNSEQuarterlyResults(symbol: string): Promise<IRDocume
       const quarterLabel = quarter ?? row.relatingTo;
       const title = `${quarterLabel} ${fiscalYear} — ${consolidated} — ${audited}`;
 
-      // Determine the display URL: prefer XBRL → HTML result link → "#"
+      // Determine the display URL: prefer details HTML → XBRL XML → fallback page.
       const xbrlValid = isValidXbrlUrl(row.xbrl);
       const htmlLink = row.resultDetailedDataLink;
 
-      const displayUrl = xbrlValid
-        ? row.xbrl
-        : htmlLink && htmlLink !== "-"
+      const displayUrl = htmlLink && htmlLink !== "-"
         ? htmlLink
+        : xbrlValid
+        ? row.xbrl
         : buildQuarterlyFallbackUrl(symbol, row);
 
       const doc: IRDocument = {

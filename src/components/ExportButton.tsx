@@ -1,4 +1,3 @@
-// @ts-nocheck
 "use client";
 
 import { CompanyInsights } from "@/types/financial";
@@ -121,7 +120,7 @@ export default function ExportButton({ insights }: ExportButtonProps) {
       <div className="mt-4 p-3 bg-yellow-50 rounded text-sm text-gray-700">
         <p className="font-medium mb-2">Note:</p>
         <p>
-          To enable Google Sheets export, you'll need to:
+          To enable Google Sheets export, you will need to:
         </p>
         <ol className="list-decimal list-inside mt-2 space-y-1">
           <li>Create a Google Cloud project</li>

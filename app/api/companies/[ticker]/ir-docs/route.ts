@@ -89,7 +89,29 @@ function dedup(docs: IRDocument[]): IRDocument[] {
  * Normalize mixed URL formats into an absolute, valid URL string.
  * Returns null for unparseable or unsupported URL shapes.
  */
-function normalizeDocUrl(rawUrl: string, requestUrl: string): string | null {
+function getCanonicalAppOrigin(requestUrl: string): string {
+  const envCandidates = [
+    process.env.APP_BASE_URL,
+    process.env.NEXT_PUBLIC_APP_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL
+      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+      : undefined,
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined,
+  ];
+
+  for (const candidate of envCandidates) {
+    if (!candidate) continue;
+    try {
+      return new URL(candidate).origin;
+    } catch {
+      // Ignore malformed env values and continue.
+    }
+  }
+
+  return new URL(requestUrl).origin;
+}
+
+function normalizeDocUrl(rawUrl: string, appOrigin: string): string | null {
   const trimmed = rawUrl.trim();
   if (!trimmed) return null;
 
@@ -104,7 +126,7 @@ function normalizeDocUrl(rawUrl: string, requestUrl: string): string | null {
     }
     // Relative app URL: /api/bse-doc?name=...
     if (trimmed.startsWith("/")) {
-      return new URL(trimmed, requestUrl).toString();
+      return new URL(trimmed, appOrigin).toString();
     }
     // Bare host/path URL: example.com/file.pdf
     if (/^[a-z0-9.-]+\.[a-z]{2,}([/:?#]|$)/i.test(trimmed)) {
@@ -140,6 +162,7 @@ export async function GET(
 
   const docs: IRDocument[] = [];
   let companyName = upperTicker;
+  let bseDocsFetchedCount = 0;
 
   // 1. Custom scraper results (highest priority — company-specific)
   if (scraperResult.status === "fulfilled" && scraperResult.value) {
@@ -168,6 +191,7 @@ export async function GET(
   const bseCodeValue = bseCode.status === "fulfilled" ? bseCode.value : null;
   if (bseCodeValue) {
     const bseDocs = await fetchBSEFilings(bseCodeValue);
+    bseDocsFetchedCount = bseDocs.length;
 
     // BSE is primary for presentations/concalls/KPIs.
     // For quarterly-results and annual-report, prefer NSE but fall back to BSE
@@ -182,10 +206,12 @@ export async function GET(
     }
   }
 
+  const appOrigin = getCanonicalAppOrigin(request.url);
+
   // Ensure API output always carries valid absolute URLs.
   const normalizedDocs = docs
     .map((doc) => {
-      const normalizedUrl = normalizeDocUrl(doc.url, request.url);
+      const normalizedUrl = normalizeDocUrl(doc.url, appOrigin);
       if (!normalizedUrl) return null;
       return { ...doc, url: normalizedUrl };
     })
@@ -215,7 +241,7 @@ export async function GET(
     nseAnnouncements:
       nseAnnouncementsResult.status === "fulfilled" && nseAnnouncementsResult.value.length > 0,
     bseCode: bseCodeValue ?? null,
-    bseFilings: bseCodeValue !== null,
+    bseFilings: bseDocsFetchedCount > 0,
   };
 
   return NextResponse.json(

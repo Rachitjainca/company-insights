@@ -129,13 +129,13 @@ export default function Home() {
             </button>
           </div>
 
+          <ExportButton company={selectedCompany} selectedDocs={selectedDocs} />
+
           <CompanyDocuments
+            key={selectedCompany.symbol}
             ticker={selectedCompany.symbol}
-            companyName={selectedCompany.name}
             onSelectionChange={setSelectedDocs}
           />
-
-          <ExportButton company={selectedCompany} selectedDocs={selectedDocs} />
         </main>
       )}
 

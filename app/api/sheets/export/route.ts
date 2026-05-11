@@ -21,7 +21,6 @@ const SOURCE_FETCH_HEADERS: HeadersInit = {
 
 const MAX_SOURCE_FILE_BYTES = 12 * 1024 * 1024;
 const MAX_DOC_TEXT_CHARS = 800000;
-const MAX_PREVIEW_CHARS = 45000;
 
 interface ExportDocument {
   category: string;
@@ -31,6 +30,7 @@ interface ExportDocument {
   url: string;
   type: string;
   xbrlUrl?: string;
+  source?: string;
 }
 
 interface ExportRequest {
@@ -43,9 +43,7 @@ interface ExportRequest {
   /** "metadata" (default): one row per document with URL.
    *  "xbrl": parse XBRL for quarterly-results docs and write financial metric columns. */
   exportMode?: "metadata" | "xbrl";
-  /** When true, fetch and extract file text content into sheet columns. */
-  includeContent?: boolean;
-  /** When true, create a Google Doc per extracted file and include doc URL in sheet. */
+  /** When true (default), create a Google Doc per document with extracted finance/KPI tables. */
   createGoogleDocs?: boolean;
 }
 
@@ -55,8 +53,7 @@ interface AppendResult {
   docsCreated: number;
 }
 
-interface SourceToDocResult {
-  docUrl: string | null;
+interface SourceTextResult {
   extractedText: string;
   status: string;
 }
@@ -197,23 +194,137 @@ function normalizeWhitespace(text: string): string {
     .trim();
 }
 
-function toPreview(text: string): string {
-  if (text.length <= MAX_PREVIEW_CHARS) return text;
-  return `${text.slice(0, MAX_PREVIEW_CHARS - 80)}\n\n[Truncated in sheet preview]`;
-}
-
 function toDocText(text: string): string {
   if (text.length <= MAX_DOC_TEXT_CHARS) return text;
   return `${text.slice(0, MAX_DOC_TEXT_CHARS - 80)}\n\n[Truncated for Google Doc size limit]`;
 }
 
-async function createGoogleDocFromSourceUrl(
+const CATEGORY_LABELS: Record<string, string> = {
+  "quarterly-results": "Quarterly Results",
+  "investor-presentation": "Investor Presentation",
+  "concall": "Concall",
+  "annual-report": "Annual Report",
+  "kpi-handbook": "KPI Handbook",
+};
+
+const FINANCIAL_KPI_RE =
+  /revenue|income|expense|ebitda|ebit|pbt|pat|profit|loss|eps|margin|cash\s*flow|asset|liabilit|debt|borrow|capex|kpi|key\s*performance|operat(?:ing|ional)|volume|utili[sz]ation|subscriber|arpu|aov|order|guidance|roe|roa|roce|gnpa|nnpa|aum/i;
+
+function isTableLikeLine(line: string): boolean {
+  const numericTokens = line.match(/-?\d[\d,]*(?:\.\d+)?%?/g) ?? [];
+  const hasDelimiter = /\t|\|| {2,}/.test(line);
+  return numericTokens.length >= 2 && (hasDelimiter || line.length <= 160);
+}
+
+function extractFinancialKpiText(rawText: string): string {
+  const lines = normalizeWhitespace(rawText)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const picked: string[] = [];
+  const seen = new Set<string>();
+
+  const pushUnique = (line: string) => {
+    if (!line || seen.has(line)) return;
+    seen.add(line);
+    picked.push(line);
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!FINANCIAL_KPI_RE.test(line)) continue;
+
+    pushUnique(line);
+
+    let misses = 0;
+    for (let j = i + 1; j < Math.min(lines.length, i + 20); j += 1) {
+      const next = lines[j];
+      const keep = FINANCIAL_KPI_RE.test(next) || isTableLikeLine(next);
+      if (keep) {
+        pushUnique(next);
+        misses = 0;
+      } else {
+        misses += 1;
+        if (misses >= 3) break;
+      }
+    }
+  }
+
+  if (picked.length === 0) {
+    lines
+      .filter((line) => FINANCIAL_KPI_RE.test(line))
+      .slice(0, 150)
+      .forEach((line) => pushUnique(line));
+  }
+
+  if (picked.length === 0) return "";
+  return toDocText(picked.join("\n"));
+}
+
+function buildDocHeader(data: ExportRequest, doc: ExportDocument): string {
+  const period = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" · ");
+  const sourceLabel = doc.source ? String(doc.source).toUpperCase() : "N/A";
+
+  return [
+    `Company: ${data.company.name} (${data.company.symbol})`,
+    `Category: ${CATEGORY_LABELS[doc.category] ?? doc.category}`,
+    `Title: ${doc.title}`,
+    `Period: ${period || "N/A"}`,
+    `Source: ${sourceLabel}`,
+    `Source URL: ${doc.url}`,
+    doc.xbrlUrl ? `XBRL URL: ${doc.xbrlUrl}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatMetricValue(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value)) return "";
+  return Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+}
+
+function buildXbrlFinancialDoc(
+  data: ExportRequest,
+  doc: ExportDocument,
+  metrics: Record<string, number | null>
+): string {
+  const metricRows = ORDERED_METRICS.filter((label) => metrics[label] !== undefined)
+    .map((label) => `${label}\t${formatMetricValue(metrics[label])}`);
+
+  if (metricRows.length === 0) return "";
+
+  return toDocText(
+    [
+      buildDocHeader(data, doc),
+      "",
+      "Financial and Key KPI Table (XBRL taxonomy mapped)",
+      "Metric\tValue",
+      ...metricRows,
+    ].join("\n")
+  );
+}
+
+async function deleteDriveFile(accessToken: string, fileId: string): Promise<void> {
+  try {
+    await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+  } catch {
+    // Best effort cleanup only.
+  }
+}
+
+async function extractSourceTextViaGoogleConversion(
   accessToken: string,
   title: string,
   sourceUrl: string
-): Promise<SourceToDocResult> {
+): Promise<SourceTextResult> {
   if (!/^https?:\/\//i.test(sourceUrl)) {
-    return { docUrl: null, extractedText: "", status: "invalid-url" };
+    return { extractedText: "", status: "invalid-url" };
   }
 
   try {
@@ -226,7 +337,6 @@ async function createGoogleDocFromSourceUrl(
 
     if (!sourceRes.ok) {
       return {
-        docUrl: null,
         extractedText: "",
         status: `source-fetch-failed-${sourceRes.status}`,
       };
@@ -234,7 +344,7 @@ async function createGoogleDocFromSourceUrl(
 
     const contentLength = Number(sourceRes.headers.get("content-length") || "0");
     if (contentLength > 0 && contentLength > MAX_SOURCE_FILE_BYTES) {
-      return { docUrl: null, extractedText: "", status: "source-too-large" };
+      return { extractedText: "", status: "source-too-large" };
     }
 
     const sourceMimeType =
@@ -244,7 +354,7 @@ async function createGoogleDocFromSourceUrl(
 
     const sourceBytes = new Uint8Array(await sourceRes.arrayBuffer());
     if (sourceBytes.byteLength > MAX_SOURCE_FILE_BYTES) {
-      return { docUrl: null, extractedText: "", status: "source-too-large" };
+      return { extractedText: "", status: "source-too-large" };
     }
 
     const boundary = `drive-upload-${Date.now()}`;
@@ -290,44 +400,112 @@ async function createGoogleDocFromSourceUrl(
     );
 
     if (!uploadRes.ok) {
-      return { docUrl: null, extractedText: "", status: "doc-conversion-failed" };
+      return { extractedText: "", status: "doc-conversion-failed" };
     }
 
     const uploaded = await uploadRes.json();
     const fileId = uploaded?.id as string | undefined;
     if (!fileId) {
-      return { docUrl: null, extractedText: "", status: "doc-id-missing" };
+      return { extractedText: "", status: "doc-id-missing" };
     }
 
-    const docUrl = `https://docs.google.com/document/d/${fileId}/edit`;
+    try {
+      const exportRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }
+      );
 
-    const exportRes = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
+      if (!exportRes.ok) {
+        return { extractedText: "", status: "doc-created-no-text-export" };
       }
-    );
 
-    if (!exportRes.ok) {
-      return { docUrl, extractedText: "", status: "doc-created-no-text-export" };
+      const exportedText = normalizeWhitespace(await exportRes.text());
+      return {
+        extractedText: toDocText(exportedText),
+        status: exportedText ? "ok-via-doc-conversion" : "doc-created-empty-text",
+      };
+    } finally {
+      await deleteDriveFile(accessToken, fileId);
     }
-
-    const exportedText = normalizeWhitespace(await exportRes.text());
-    return {
-      docUrl,
-      extractedText: toDocText(exportedText),
-      status: exportedText ? "ok-via-doc-conversion" : "doc-created-empty-text",
-    };
   } catch {
-    return { docUrl: null, extractedText: "", status: "doc-conversion-error" };
+    return { extractedText: "", status: "doc-conversion-error" };
   }
 }
 
+async function buildGoogleDocContentForDocument(
+  accessToken: string,
+  data: ExportRequest,
+  doc: ExportDocument
+): Promise<{ docText: string; status: string }> {
+  // Prefer taxonomy-based extraction for quarterly result docs with XBRL.
+  if (doc.category === "quarterly-results" && doc.xbrlUrl) {
+    const metrics = await parseQuarterlyXBRL(doc.xbrlUrl, NSE_HEADERS);
+    const xbrlDocText = buildXbrlFinancialDoc(data, doc, metrics);
+    if (xbrlDocText) {
+      return { docText: xbrlDocText, status: "ok-xbrl-taxonomy" };
+    }
+  }
+
+  const extracted = await extractDocumentContent(doc.url);
+  if (extracted.fullText) {
+    const filtered = extractFinancialKpiText(extracted.fullText);
+    if (filtered) {
+      return {
+        docText: toDocText(
+          [
+            buildDocHeader(data, doc),
+            "",
+            "Financial and Key KPI Tables",
+            filtered,
+          ].join("\n")
+        ),
+        status: `ok-filtered-${extracted.status}`,
+      };
+    }
+  }
+
+  const converted = await extractSourceTextViaGoogleConversion(
+    accessToken,
+    `${data.company.symbol} - ${doc.title}`.slice(0, 120),
+    doc.url
+  );
+  if (converted.extractedText) {
+    const filtered = extractFinancialKpiText(converted.extractedText);
+    if (filtered) {
+      return {
+        docText: toDocText(
+          [
+            buildDocHeader(data, doc),
+            "",
+            "Financial and Key KPI Tables",
+            filtered,
+          ].join("\n")
+        ),
+        status: `ok-filtered-${converted.status}`,
+      };
+    }
+  }
+
+  return {
+    docText: toDocText(
+      [
+        buildDocHeader(data, doc),
+        "",
+        "Financial and KPI extraction was not available for this file.",
+      ].join("\n")
+    ),
+    status: `no-financial-kpi-${converted.status || extracted.status}`,
+  };
+}
+
 /**
- * Append IR document metadata rows to Google Sheet (one row per document).
+ * Append IR document links rows to Google Sheet (one row per document).
+ * Sheet keeps source link + Google Doc link only (no content preview columns).
  */
 async function appendDocumentRows(
   accessToken: string,
@@ -335,16 +513,7 @@ async function appendDocumentRows(
   data: ExportRequest
 ): Promise<AppendResult> {
   try {
-    const CATEGORY_LABELS: Record<string, string> = {
-      "quarterly-results": "Quarterly Results",
-      "investor-presentation": "Investor Presentation",
-      "concall": "Concall",
-      "annual-report": "Annual Report",
-      "kpi-handbook": "KPI Handbook",
-    };
-
-    const includeContent = data.includeContent !== false;
-    const createGoogleDocs = includeContent && data.createGoogleDocs !== false;
+    const createGoogleDocs = data.createGoogleDocs !== false;
 
     const headers = [
       "Company",
@@ -352,77 +521,45 @@ async function appendDocumentRows(
       "Category",
       "Period",
       "Title",
-      "URL",
-      "Type",
+      "Source URL",
+      "Google Doc URL",
+      "Doc Status",
+      "Source",
     ];
-
-    if (includeContent) {
-      headers.push("Content Status", "Content Type", "Content Preview", "Google Doc URL");
-    }
 
     const rows: string[][] = [];
     let docsCreated = 0;
 
     for (const doc of data.documents) {
       const period = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" · ");
-      const row = [
+      let googleDocUrl = "";
+      let docStatus = createGoogleDocs ? "doc-pending" : "doc-disabled";
+
+      if (createGoogleDocs) {
+        const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
+        const content = await buildGoogleDocContentForDocument(accessToken, data, doc);
+        const createdDoc = await createGoogleDoc(accessToken, safeTitle, content.docText);
+
+        if (createdDoc) {
+          googleDocUrl = createdDoc;
+          docsCreated += 1;
+          docStatus = content.status;
+        } else {
+          docStatus = `doc-create-failed-${content.status}`;
+        }
+      }
+
+      rows.push([
         data.company.name,
         data.company.symbol,
         CATEGORY_LABELS[doc.category] ?? doc.category,
         period,
         doc.title,
         doc.url,
-        doc.type.toUpperCase(),
-      ];
-
-      if (includeContent) {
-        const extracted = await extractDocumentContent(doc.url);
-        let contentStatus = extracted.status;
-        let contentType = extracted.mimeType || "";
-        let contentPreview = extracted.preview;
-        let googleDocUrl = "";
-
-        if (createGoogleDocs && extracted.fullText) {
-          const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
-          const createdDoc = await createGoogleDoc(
-            accessToken,
-            safeTitle,
-            extracted.fullText
-          );
-          if (createdDoc) {
-            googleDocUrl = createdDoc;
-            docsCreated += 1;
-          }
-        } else if (createGoogleDocs && !extracted.fullText) {
-          const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
-          const converted = await createGoogleDocFromSourceUrl(
-            accessToken,
-            safeTitle,
-            doc.url
-          );
-
-          if (converted.docUrl) {
-            googleDocUrl = converted.docUrl;
-            docsCreated += 1;
-          }
-
-          if (!contentPreview && converted.extractedText) {
-            contentPreview = toPreview(converted.extractedText);
-            contentStatus = converted.status;
-          } else if (contentStatus !== "ok") {
-            contentStatus = converted.status;
-          }
-        }
-
-        row.push(
-          contentStatus,
-          contentType,
-          contentPreview,
-          googleDocUrl
-        );
-      }
-
-      rows.push(row);
+        googleDocUrl,
+        docStatus,
+        doc.source ? String(doc.source).toUpperCase() : "",
+      ]);
     }
 
     const values = [headers, ...rows];
@@ -593,12 +730,8 @@ export async function POST(request: NextRequest) {
     }
 
     const exportMode = companyData.exportMode === "xbrl" ? "xbrl" : "metadata";
-    const includeContent =
-      exportMode === "metadata" ? companyData.includeContent !== false : false;
     const createGoogleDocs =
-      exportMode === "metadata" && includeContent
-        ? companyData.createGoogleDocs !== false
-        : false;
+      exportMode === "metadata" ? companyData.createGoogleDocs !== false : false;
 
     if (
       exportMode === "xbrl" &&
@@ -620,9 +753,7 @@ export async function POST(request: NextRequest) {
     const modeLabel =
       exportMode === "xbrl"
         ? "XBRL Financials"
-        : includeContent
-        ? "IR Content Export"
-        : "IR Documents";
+        : "IR Links + Docs";
     const title = `${companyData.company.symbol} - ${modeLabel} - ${new Date().toISOString().split("T")[0]}`;
     const spreadsheetId = await createSpreadsheet(token, title);
 
@@ -642,7 +773,6 @@ export async function POST(request: NextRequest) {
         ? await appendXBRLRows(token, spreadsheetId, companyData)
         : await appendDocumentRows(token, spreadsheetId, {
             ...companyData,
-            includeContent,
             createGoogleDocs,
           });
 
@@ -652,7 +782,7 @@ export async function POST(request: NextRequest) {
           error:
             exportMode === "xbrl"
               ? "Failed to append parsed XBRL data to Google Sheet."
-              : "Failed to append document content rows to Google Sheet.",
+              : "Failed to append document links rows to Google Sheet.",
           code: "SHEET_APPEND_FAILED",
         },
         { status: 500 }

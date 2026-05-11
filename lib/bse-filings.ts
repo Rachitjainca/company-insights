@@ -29,6 +29,16 @@ interface BSEFilingsResponse {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const BSE_CDN = "https://www.bseindia.com";
+const BSE_FETCH_RETRIES = 3;
+
+const BSE_HEADERS: HeadersInit = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+  Referer: "https://www.bseindia.com/",
+  Origin: "https://www.bseindia.com",
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+};
 
 // Keyword patterns to classify filing headlines into IR categories.
 // Order matters: first match wins. More specific patterns are listed first.
@@ -146,6 +156,31 @@ function buildDocUrl(raw: BSEFilingRaw): string {
   return BSE_CDN;
 }
 
+async function fetchBSEJsonWithRetry(url: string): Promise<BSEFilingsResponse | null> {
+  for (let attempt = 0; attempt < BSE_FETCH_RETRIES; attempt += 1) {
+    const attemptUrl = `${url}&_=${Date.now()}${attempt}`;
+    try {
+      const res = await fetch(attemptUrl, {
+        headers: BSE_HEADERS,
+        cache: "no-store",
+        next: { revalidate: 3600 },
+      });
+      if (!res.ok) continue;
+
+      // BSE can occasionally reply with non-JSON despite 200; guard parse.
+      const text = await res.text();
+      if (!text.trimStart().startsWith("{")) continue;
+
+      const parsed = JSON.parse(text) as BSEFilingsResponse;
+      if (Array.isArray(parsed?.Table)) return parsed;
+    } catch {
+      // Ignore and retry.
+    }
+  }
+
+  return null;
+}
+
 // ─── BSE scrip master cache ────────────────────────────────────────────────────
 //
 // The BSE "getScripHeaderData" API returns null for NSE symbols.
@@ -219,24 +254,24 @@ export async function lookupBSECode(nseSymbol: string): Promise<string | null> {
 export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
   try {
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-    const url =
+    const baseUrl =
       `https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w` +
       `?pageno=1&strCat=-1&strPrevDate=20200101&strScrip=${encodeURIComponent(bseCode)}` +
-      `&strSearch=P&strToDate=${today}&strType=C`;
+      `&strToDate=${today}&strType=C`;
 
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        Referer: "https://www.bseindia.com/",
-        Origin: "https://www.bseindia.com",
-        Accept: "application/json",
-      },
-      next: { revalidate: 3600 },
-    });
-    if (!res.ok) return [];
-    const data: BSEFilingsResponse = await res.json();
-    const rows = data?.Table ?? [];
+    // `strSearch=P` is primary; blank fallback helps when BSE filters change.
+    const candidates = [`${baseUrl}&strSearch=P`, `${baseUrl}&strSearch=`];
+
+    let rows: BSEFilingRaw[] = [];
+    for (const candidate of candidates) {
+      const data = await fetchBSEJsonWithRetry(candidate);
+      if (data?.Table && data.Table.length > 0) {
+        rows = data.Table;
+        break;
+      }
+    }
+
+    if (rows.length === 0) return [];
 
     const docs: IRDocument[] = [];
     for (const row of rows) {
@@ -258,6 +293,7 @@ export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
         source: "bse",
       });
     }
+
     return docs;
   } catch {
     return [];

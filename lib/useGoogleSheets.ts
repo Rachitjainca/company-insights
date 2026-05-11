@@ -1,5 +1,16 @@
 import { useState, useEffect } from "react";
 
+type SheetsExportPayload = Record<string, unknown>;
+
+interface SheetsExportResult {
+  success?: boolean;
+  code?: string;
+  error?: string;
+  message?: string;
+  sheetUrl?: string;
+  [key: string]: unknown;
+}
+
 export function useGoogleSheets() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -7,26 +18,31 @@ export function useGoogleSheets() {
 
   // Check if user is authenticated on component mount
   useEffect(() => {
-    checkAuthStatus();
-  }, []);
+    let cancelled = false;
 
-  const checkAuthStatus = async () => {
-    try {
-      // Check if there's an access token by attempting a simple API call
-      const response = await fetch("/api/sheets/status", {
-        method: "GET",
-        credentials: "include",
-      });
+    const runAuthStatusCheck = async () => {
+      try {
+        const response = await fetch("/api/sheets/status", {
+          method: "GET",
+          credentials: "include",
+        });
 
-      if (response.ok) {
-        setIsAuthenticated(true);
-      } else {
-        setIsAuthenticated(false);
+        if (!cancelled) {
+          setIsAuthenticated(response.ok);
+        }
+      } catch {
+        if (!cancelled) {
+          setIsAuthenticated(false);
+        }
       }
-    } catch (err) {
-      setIsAuthenticated(false);
-    }
-  };
+    };
+
+    void runAuthStatusCheck();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const initiateAuth = () => {
     setLoading(true);
@@ -34,7 +50,7 @@ export function useGoogleSheets() {
     window.location.href = "/api/sheets/auth";
   };
 
-  const exportToSheets = async (data: any): Promise<any> => {
+  const exportToSheets = async (data: SheetsExportPayload): Promise<SheetsExportResult> => {
     setLoading(true);
     setError(null);
 
@@ -48,7 +64,7 @@ export function useGoogleSheets() {
         body: JSON.stringify(data),
       });
 
-      const result = await response.json();
+      const result = (await response.json()) as SheetsExportResult;
 
       if (!response.ok) {
         if (result.code === "NOT_AUTHENTICATED") {
