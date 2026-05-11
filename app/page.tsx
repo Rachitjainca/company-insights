@@ -93,6 +93,8 @@ export default function Home() {
       ) : (
         /* Results screen */
         <main className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-5">
+          <ExportButton company={selectedCompany} selectedDocs={selectedDocs} />
+
           {/* Company header */}
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm px-6 py-4 flex flex-wrap items-center justify-between gap-4">
             <div className="flex items-center gap-4 min-w-0">
@@ -128,8 +130,6 @@ export default function Home() {
               Search again
             </button>
           </div>
-
-          <ExportButton company={selectedCompany} selectedDocs={selectedDocs} />
 
           <CompanyDocuments
             key={selectedCompany.symbol}

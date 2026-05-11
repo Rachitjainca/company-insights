@@ -64,6 +64,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
   const [sheetUrl, setSheetUrl] = useState("");
   const [showSuccess, setShowSuccess] = useState(false);
   const [xbrlMode, setXbrlMode] = useState(false);
+  const [includeContent, setIncludeContent] = useState(true);
 
   // Whether any selected doc has an XBRL URL and is a quarterly result
   const hasXbrlDocs = selectedDocs.some(
@@ -94,6 +95,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
         documents: selectedDocs,
         exportMode: effectiveXbrlMode ? "xbrl" : "metadata",
         createGoogleDocs: true,
+        includeContent: effectiveXbrlMode ? false : includeContent,
       });
       if (result.success) {
         setSheetUrl(result.sheetUrl ?? "");
@@ -137,9 +139,18 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
             />
           )}
           {!effectiveXbrlMode && (
+            <ToggleCard
+              checked={includeContent}
+              onChange={setIncludeContent}
+              label="Include extracted content in Sheet"
+              description="Adds financial and KPI text extracted from each file into a content column in Google Sheets."
+            />
+          )}
+          {!effectiveXbrlMode && (
             <div className="px-3.5 py-3 rounded-xl border border-gray-200 bg-gray-50 text-xs text-gray-600 leading-relaxed">
-              Metadata export writes only links in the sheet: source file URL + Google Doc URL.
-              The Google Doc is populated with financial and key KPI tables when available.
+              {includeContent
+                ? "Metadata export writes links and extracted financial/KPI content into the sheet, and also creates a Google Doc."
+                : "Metadata export writes links in the sheet: source file URL + Google Doc URL. The Google Doc is populated with financial and key KPI tables when available."}
             </div>
           )}
         </div>
@@ -172,6 +183,13 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
             Export XBRL to Sheets
+          </>
+        ) : includeContent ? (
+          <>
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6l4 2m5-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Export Content + Docs to Sheets
           </>
         ) : (
           <>

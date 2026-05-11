@@ -19,8 +19,10 @@ const SOURCE_FETCH_HEADERS: HeadersInit = {
   Referer: "https://www.nseindia.com/",
 };
 
-const MAX_SOURCE_FILE_BYTES = 12 * 1024 * 1024;
+const MAX_SOURCE_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_DOC_TEXT_CHARS = 800000;
+const MAX_SHEET_CONTENT_CHARS = 20000;
+const SOURCE_CONVERSION_TIMEOUT_MS = 120000;
 
 interface ExportDocument {
   category: string;
@@ -45,6 +47,8 @@ interface ExportRequest {
   exportMode?: "metadata" | "xbrl";
   /** When true (default), create a Google Doc per document with extracted finance/KPI tables. */
   createGoogleDocs?: boolean;
+  /** When true, write extracted finance/KPI content into a sheet column for metadata mode. */
+  includeContent?: boolean;
 }
 
 interface AppendResult {
@@ -199,6 +203,12 @@ function toDocText(text: string): string {
   return `${text.slice(0, MAX_DOC_TEXT_CHARS - 80)}\n\n[Truncated for Google Doc size limit]`;
 }
 
+function toSheetContent(text: string): string {
+  const normalized = normalizeWhitespace(text);
+  if (normalized.length <= MAX_SHEET_CONTENT_CHARS) return normalized;
+  return `${normalized.slice(0, MAX_SHEET_CONTENT_CHARS - 40)}\n[Truncated for sheet cell size]`;
+}
+
 const CATEGORY_LABELS: Record<string, string> = {
   "quarterly-results": "Quarterly Results",
   "investor-presentation": "Investor Presentation",
@@ -318,14 +328,22 @@ async function deleteDriveFile(accessToken: string, fileId: string): Promise<voi
   }
 }
 
-async function extractSourceTextViaGoogleConversion(
+function shouldRetrySourceConversion(status: string): boolean {
+  if (status === "invalid-url") return false;
+  if (status.startsWith("source-too-large")) return false;
+  if (/source-fetch-failed-4\d\d/.test(status)) return false;
+  if (/doc-conversion-init-failed-4\d\d/.test(status)) return false;
+  if (/doc-conversion-failed-4\d\d/.test(status)) return false;
+  return true;
+}
+
+async function attemptSourceTextViaGoogleConversion(
   accessToken: string,
   title: string,
   sourceUrl: string
 ): Promise<SourceTextResult> {
-  if (!/^https?:\/\//i.test(sourceUrl)) {
-    return { extractedText: "", status: "invalid-url" };
-  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_CONVERSION_TIMEOUT_MS);
 
   try {
     const sourceRes = await fetch(sourceUrl, {
@@ -333,6 +351,7 @@ async function extractSourceTextViaGoogleConversion(
       headers: SOURCE_FETCH_HEADERS,
       cache: "no-store",
       redirect: "follow",
+      signal: controller.signal,
     });
 
     if (!sourceRes.ok) {
@@ -352,59 +371,90 @@ async function extractSourceTextViaGoogleConversion(
         .split(";")[0]
         .trim();
 
-    const sourceBytes = new Uint8Array(await sourceRes.arrayBuffer());
-    if (sourceBytes.byteLength > MAX_SOURCE_FILE_BYTES) {
-      return { extractedText: "", status: "source-too-large" };
+    let uploadBody: BodyInit;
+    let uploadByteLength = contentLength;
+
+    // Prefer stream upload when size is known to reduce memory pressure.
+    if (sourceRes.body && contentLength > 0) {
+      uploadBody = sourceRes.body;
+    } else {
+      const sourceBytes = new Uint8Array(await sourceRes.arrayBuffer());
+      if (sourceBytes.byteLength > MAX_SOURCE_FILE_BYTES) {
+        return { extractedText: "", status: "source-too-large" };
+      }
+      uploadBody = sourceBytes;
+      uploadByteLength = sourceBytes.byteLength;
     }
 
-    const boundary = `drive-upload-${Date.now()}`;
-    const encoder = new TextEncoder();
+    const initHeaders: Record<string, string> = {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+      "X-Upload-Content-Type": sourceMimeType,
+    };
 
-    const metadataPart = encoder.encode(
-      `--${boundary}\r\n` +
-        "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
-        `${JSON.stringify({
-          name: title,
-          mimeType: "application/vnd.google-apps.document",
-        })}\r\n`
-    );
+    if (uploadByteLength > 0) {
+      initHeaders["X-Upload-Content-Length"] = String(uploadByteLength);
+    }
 
-    const mediaHeader = encoder.encode(
-      `--${boundary}\r\n` +
-        `Content-Type: ${sourceMimeType}\r\n\r\n`
-    );
-
-    const closePart = encoder.encode(`\r\n--${boundary}--`);
-
-    const body = new Uint8Array(
-      metadataPart.length + mediaHeader.length + sourceBytes.length + closePart.length
-    );
-    body.set(metadataPart, 0);
-    body.set(mediaHeader, metadataPart.length);
-    body.set(sourceBytes, metadataPart.length + mediaHeader.length);
-    body.set(
-      closePart,
-      metadataPart.length + mediaHeader.length + sourceBytes.length
-    );
-
-    const uploadRes = await fetch(
-      "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
+    const initRes = await fetch(
+      "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id",
       {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": `multipart/related; boundary=${boundary}`,
-        },
-        body,
+        headers: initHeaders,
+        body: JSON.stringify({
+          name: title,
+          mimeType: "application/vnd.google-apps.document",
+        }),
+        signal: controller.signal,
       }
     );
 
-    if (!uploadRes.ok) {
-      return { extractedText: "", status: "doc-conversion-failed" };
+    if (!initRes.ok) {
+      return {
+        extractedText: "",
+        status: `doc-conversion-init-failed-${initRes.status}`,
+      };
     }
 
-    const uploaded = await uploadRes.json();
-    const fileId = uploaded?.id as string | undefined;
+    const resumableUrl = initRes.headers.get("location");
+    if (!resumableUrl) {
+      return { extractedText: "", status: "doc-conversion-session-missing" };
+    }
+
+    const uploadHeaders: Record<string, string> = {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": sourceMimeType,
+    };
+
+    if (uploadByteLength > 0) {
+      uploadHeaders["Content-Length"] = String(uploadByteLength);
+    }
+
+    const uploadRequest: RequestInit & { duplex?: "half" } = {
+      method: "PUT",
+      headers: uploadHeaders,
+      body: uploadBody,
+      signal: controller.signal,
+    };
+
+    if (sourceRes.body && contentLength > 0) {
+      uploadRequest.duplex = "half";
+    }
+
+    const uploadRes = await fetch(resumableUrl, uploadRequest);
+
+    if (!uploadRes.ok) {
+      return {
+        extractedText: "",
+        status: `doc-conversion-failed-${uploadRes.status}`,
+      };
+    }
+
+    const uploaded = (await uploadRes.json().catch(() => null)) as
+      | { id?: string }
+      | null;
+    const fileId = uploaded?.id;
+
     if (!fileId) {
       return { extractedText: "", status: "doc-id-missing" };
     }
@@ -417,11 +467,15 @@ async function extractSourceTextViaGoogleConversion(
           headers: {
             Authorization: `Bearer ${accessToken}`,
           },
+          signal: controller.signal,
         }
       );
 
       if (!exportRes.ok) {
-        return { extractedText: "", status: "doc-created-no-text-export" };
+        return {
+          extractedText: "",
+          status: `doc-created-no-text-export-${exportRes.status}`,
+        };
       }
 
       const exportedText = normalizeWhitespace(await exportRes.text());
@@ -432,9 +486,52 @@ async function extractSourceTextViaGoogleConversion(
     } finally {
       await deleteDriveFile(accessToken, fileId);
     }
-  } catch {
-    return { extractedText: "", status: "doc-conversion-error" };
+  } catch (error) {
+    const isAbort =
+      error instanceof Error &&
+      (error.name === "AbortError" || error.message.toLowerCase().includes("abort"));
+
+    return {
+      extractedText: "",
+      status: isAbort ? "doc-conversion-timeout" : "doc-conversion-error",
+    };
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+async function extractSourceTextViaGoogleConversion(
+  accessToken: string,
+  title: string,
+  sourceUrl: string
+): Promise<SourceTextResult> {
+  if (!/^https?:\/\//i.test(sourceUrl)) {
+    return { extractedText: "", status: "invalid-url" };
+  }
+
+  let lastResult: SourceTextResult = {
+    extractedText: "",
+    status: "doc-conversion-error",
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const result = await attemptSourceTextViaGoogleConversion(
+      accessToken,
+      title,
+      sourceUrl
+    );
+
+    if (result.extractedText) {
+      return result;
+    }
+
+    lastResult = result;
+    if (!shouldRetrySourceConversion(result.status)) {
+      break;
+    }
+  }
+
+  return lastResult;
 }
 
 async function buildGoogleDocContentForDocument(
@@ -504,8 +601,8 @@ async function buildGoogleDocContentForDocument(
 }
 
 /**
- * Append IR document links rows to Google Sheet (one row per document).
- * Sheet keeps source link + Google Doc link only (no content preview columns).
+ * Append IR document rows to Google Sheet (one row per document).
+ * Can optionally include extracted financial/KPI content in a dedicated column.
  */
 async function appendDocumentRows(
   accessToken: string,
@@ -514,6 +611,7 @@ async function appendDocumentRows(
 ): Promise<AppendResult> {
   try {
     const createGoogleDocs = data.createGoogleDocs !== false;
+    const includeContent = data.includeContent === true;
 
     const headers = [
       "Company",
@@ -527,6 +625,10 @@ async function appendDocumentRows(
       "Source",
     ];
 
+    if (includeContent) {
+      headers.push("Extracted Content");
+    }
+
     const rows: string[][] = [];
     let docsCreated = 0;
 
@@ -534,10 +636,22 @@ async function appendDocumentRows(
       const period = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" · ");
       let googleDocUrl = "";
       let docStatus = createGoogleDocs ? "doc-pending" : "doc-disabled";
+      let sheetContent = "";
+
+      const needsExtraction = createGoogleDocs || includeContent;
+
+      let extractedContent: { docText: string; status: string } | null = null;
+      if (needsExtraction) {
+        extractedContent = await buildGoogleDocContentForDocument(accessToken, data, doc);
+        if (includeContent) {
+          sheetContent = toSheetContent(extractedContent.docText);
+        }
+      }
 
       if (createGoogleDocs) {
         const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
-        const content = await buildGoogleDocContentForDocument(accessToken, data, doc);
+        const content = extractedContent ??
+          (await buildGoogleDocContentForDocument(accessToken, data, doc));
         const createdDoc = await createGoogleDoc(accessToken, safeTitle, content.docText);
 
         if (createdDoc) {
@@ -560,6 +674,10 @@ async function appendDocumentRows(
         docStatus,
         doc.source ? String(doc.source).toUpperCase() : "",
       ]);
+
+      if (includeContent) {
+        rows[rows.length - 1].push(sheetContent);
+      }
     }
 
     const values = [headers, ...rows];
@@ -732,6 +850,8 @@ export async function POST(request: NextRequest) {
     const exportMode = companyData.exportMode === "xbrl" ? "xbrl" : "metadata";
     const createGoogleDocs =
       exportMode === "metadata" ? companyData.createGoogleDocs !== false : false;
+    const includeContent =
+      exportMode === "metadata" ? companyData.includeContent === true : false;
 
     if (
       exportMode === "xbrl" &&
@@ -753,6 +873,8 @@ export async function POST(request: NextRequest) {
     const modeLabel =
       exportMode === "xbrl"
         ? "XBRL Financials"
+        : includeContent
+        ? "IR Content + Docs"
         : "IR Links + Docs";
     const title = `${companyData.company.symbol} - ${modeLabel} - ${new Date().toISOString().split("T")[0]}`;
     const spreadsheetId = await createSpreadsheet(token, title);
@@ -774,6 +896,7 @@ export async function POST(request: NextRequest) {
         : await appendDocumentRows(token, spreadsheetId, {
             ...companyData,
             createGoogleDocs,
+            includeContent,
           });
 
     if (!appendResult.ok) {
@@ -782,6 +905,8 @@ export async function POST(request: NextRequest) {
           error:
             exportMode === "xbrl"
               ? "Failed to append parsed XBRL data to Google Sheet."
+              : includeContent
+              ? "Failed to append document rows with content to Google Sheet."
               : "Failed to append document links rows to Google Sheet.",
           code: "SHEET_APPEND_FAILED",
         },
