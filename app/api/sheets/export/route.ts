@@ -622,10 +622,11 @@ async function writeTablesAsSheetTabs(
   tables: ExtractedTable[],
   usedTabTitles: Set<string>,
   extractedText: string = ""
-): Promise<{ tabsCreated: number; tabTitles: string[] }> {
+): Promise<{ tabsCreated: number; tabTitles: string[]; sheetIds: number[] }> {
   const created: string[] = [];
+  const createdSheetIds: number[] = [];
   const hasText = extractedText.trim().length > 0;
-  if (tables.length === 0 && !hasText) return { tabsCreated: 0, tabTitles: [] };
+  if (tables.length === 0 && !hasText) return { tabsCreated: 0, tabTitles: [], sheetIds: [] };
 
   // Build a base tab title from doc context.
   const periodPart = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" ");
@@ -645,7 +646,7 @@ async function writeTablesAsSheetTabs(
   }
 
   const tab = await addSheetTab(accessToken, spreadsheetId, title);
-  if (!tab) return { tabsCreated: 0, tabTitles: [] };
+  if (!tab) return { tabsCreated: 0, tabTitles: [], sheetIds: [] };
   usedTabTitles.add(tab.title.toLowerCase());
 
   // Build a single values payload: a context block, then each financial
@@ -700,7 +701,7 @@ async function writeTablesAsSheetTabs(
   }
 
   const ok = await appendValuesToTab(accessToken, spreadsheetId, tab.title, values);
-  if (!ok) return { tabsCreated: 0, tabTitles: [] };
+  if (!ok) return { tabsCreated: 0, tabTitles: [], sheetIds: [] };
 
   // Pretty formatting (best-effort, non-fatal).
   if (headerRowIndex >= 0 && headerColCount > 0) {
@@ -714,7 +715,8 @@ async function writeTablesAsSheetTabs(
   }
 
   created.push(tab.title);
-  return { tabsCreated: created.length, tabTitles: created };
+  createdSheetIds.push(tab.sheetId);
+  return { tabsCreated: created.length, tabTitles: created, sheetIds: createdSheetIds };
 }
 
 function normalizeWhitespace(text: string): string {
@@ -1518,6 +1520,7 @@ async function appendDocumentRows(
       // one wall-of-text cell on the index sheet. Tab creation is sequential
       // because tab titles must be unique across the export.
       const tablesAvail = p.extracted ? p.extracted.tables : [];
+      let createdTabSheetId: number | null = null;
       if (tablesAvail.length > 0 || extractedText.length > 0) {
         const result = await writeTablesAsSheetTabs(
           accessToken,
@@ -1531,13 +1534,21 @@ async function appendDocumentRows(
         if (result.tabTitles.length > 0) {
           tablesTabLabel = result.tabTitles.join(", ");
         }
+        if (result.sheetIds.length > 0) {
+          createdTabSheetId = result.sheetIds[0];
+        }
       }
 
-      // The index-sheet "Extracted Content" column now points at the per-doc
-      // tab (or carries a short note if extraction yielded nothing) instead
-      // of holding a multi-thousand-char single-cell blob.
+      // The index-sheet "Extracted Content" column links straight into the
+      // per-doc tab via a live HYPERLINK formula (Sheets opens the tab in the
+      // same spreadsheet). When extraction yielded nothing, fall back to a
+      // short status note instead of a dead link.
       if (includeContent) {
-        if (tablesTabLabel) {
+        if (tablesTabLabel && createdTabSheetId !== null) {
+          const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=${createdTabSheetId}`;
+          const safeLabel = tablesTabLabel.replace(/"/g, '""');
+          sheetContent = `=HYPERLINK("${url}","View: ${safeLabel}")`;
+        } else if (tablesTabLabel) {
           sheetContent = `See tab: ${tablesTabLabel}`;
         } else if (p.extracted) {
           sheetContent = p.extracted.docText
