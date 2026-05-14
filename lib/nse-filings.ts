@@ -283,6 +283,20 @@ function isValidDetailsUrl(url: string | undefined): boolean {
   return true;
 }
 
+/**
+ * NSE integrated filings feed exposes `pdf_attach` — the actual PDF the
+ * issuer attached. We treat it as a valid URL when it's a normal HTTPS link
+ * (skipping the `"-"` sentinel and `null` placeholders).
+ */
+function isValidPdfAttachUrl(url: string | undefined | null): boolean {
+  if (!url) return false;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed === "-") return false;
+  if (!trimmed.startsWith("https://")) return false;
+  if (trimmed.endsWith("/null") || trimmed.endsWith("/-")) return false;
+  return true;
+}
+
 function detectType(fileName: string): DocumentLinkType {
   const f = (fileName ?? "").toLowerCase();
   if (f.endsWith(".pdf")) return "pdf";
@@ -407,7 +421,14 @@ function mapIntegratedRowsToQuarterlyDocs(
 
     const xbrlValid = isValidXbrlUrl(row.xbrl ?? "");
     const detailsValid = isValidDetailsUrl(row.ixbrl);
-    const displayUrl = detailsValid
+    const pdfValid = isValidPdfAttachUrl(row.pdf_attach);
+
+    // Prefer the actual PDF the issuer attached — this is what users expect
+    // to see when they open a quarterly result. Fall back to the iXBRL HTML
+    // detail page, then the raw XBRL XML, then the NSE listing page.
+    const displayUrl = pdfValid
+      ? row.pdf_attach!
+      : detailsValid
       ? row.ixbrl!
       : xbrlValid
       ? row.xbrl!
@@ -418,9 +439,8 @@ function mapIntegratedRowsToQuarterlyDocs(
       fiscalYear,
       quarter,
       title: `${quarter ?? row.qe_Date} ${fiscalYear} — ${consolidated} — ${audited}`,
-      // Details link (iXBRL HTML) is the primary click target; xbrlUrl holds XML.
       url: displayUrl,
-      type: "other",
+      type: pdfValid ? "pdf" : "other",
       xbrlUrl: xbrlValid ? row.xbrl : undefined,
       source: "nse",
     });
@@ -561,7 +581,6 @@ async function fetchNSEQuarterlyResultsLegacy(symbol: string): Promise<IRDocumen
     for (const row of data) {
       // Only quarterly; skip half-yearly and annual from this endpoint
       if (row.period !== "Quarterly") continue;
-      if (!isOnOrAfterIntegratedMinDate(row.toDate)) continue;
       if (docs.length >= QUARTERLY_RESULT_LIMIT) break;
 
       const quarter = relatingToQuarter(row.relatingTo);
@@ -589,7 +608,7 @@ async function fetchNSEQuarterlyResultsLegacy(symbol: string): Promise<IRDocumen
         quarter,
         title,
         url: displayUrl,
-        type: xbrlValid ? "other" : "other",
+        type: "other",
         xbrlUrl: xbrlValid ? row.xbrl : undefined,
         source: "nse",
       };
@@ -699,7 +718,7 @@ export interface NSEAnnouncement {
   attchmnt?: string;
 }
 
-const ANNOUNCEMENT_LIMIT = 120;
+const ANNOUNCEMENT_LIMIT = 300;
 
 // Keyword patterns for announcement subject classification
 const NSE_PRES_RE = /investor\s+presentation|analyst\s+(meet|day|briefing)|earnings\s+presentation|roadshow|business\s+update|earnings\s+update|\bpresentation\b/i;
@@ -756,10 +775,10 @@ export async function fetchNSEAnnouncements(symbol: string): Promise<IRDocument[
     const cookie = await getNSECookie();
     const headers = { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) };
 
-    // Build a 3-year date range; NSE expects DD-MM-YYYY
+    // Build a 5-year date range; NSE expects DD-MM-YYYY
     const now = new Date();
     const toDate = `${String(now.getDate()).padStart(2, "0")}-${String(now.getMonth() + 1).padStart(2, "0")}-${now.getFullYear()}`;
-    const fromDate = `01-01-${now.getFullYear() - 3}`;
+    const fromDate = `01-01-${now.getFullYear() - 5}`;
 
     const url =
       `https://www.nseindia.com/api/corporate-announcements` +

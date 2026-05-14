@@ -249,31 +249,42 @@ export async function lookupBSECode(nseSymbol: string): Promise<string | null> {
 
 /**
  * Fetch investor-relations filings for a BSE scrip code.
- * Covers announcements going back to 2020.
+ * Covers announcements going back to 2020. Walks up to 5 pages of the BSE
+ * announcements feed so older investor presentations / annual reports are
+ * captured (each page returns ~25-50 rows).
  */
 export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
   try {
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-    const baseUrl =
+    const buildUrl = (pageno: number, search: "P" | "") =>
       `https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w` +
-      `?pageno=1&strCat=-1&strPrevDate=20200101&strScrip=${encodeURIComponent(bseCode)}` +
-      `&strToDate=${today}&strType=C`;
+      `?pageno=${pageno}&strCat=-1&strPrevDate=20200101&strScrip=${encodeURIComponent(bseCode)}` +
+      `&strToDate=${today}&strType=C&strSearch=${search}`;
 
-    // `strSearch=P` is primary; blank fallback helps when BSE filters change.
-    const candidates = [`${baseUrl}&strSearch=P`, `${baseUrl}&strSearch=`];
+    const MAX_PAGES = 5;
+    const rows: BSEFilingRaw[] = [];
 
-    let rows: BSEFilingRaw[] = [];
-    for (const candidate of candidates) {
-      const data = await fetchBSEJsonWithRetry(candidate);
-      if (data?.Table && data.Table.length > 0) {
-        rows = data.Table;
-        break;
+    // Walk pages with the primary `strSearch=P` filter.
+    for (let p = 1; p <= MAX_PAGES; p += 1) {
+      const data = await fetchBSEJsonWithRetry(buildUrl(p, "P"));
+      if (!data?.Table || data.Table.length === 0) break;
+      rows.push(...data.Table);
+    }
+
+    // Fall back to the unfiltered feed if the primary returned nothing
+    // (BSE sometimes flips the `strSearch` semantics).
+    if (rows.length === 0) {
+      for (let p = 1; p <= MAX_PAGES; p += 1) {
+        const data = await fetchBSEJsonWithRetry(buildUrl(p, ""));
+        if (!data?.Table || data.Table.length === 0) break;
+        rows.push(...data.Table);
       }
     }
 
     if (rows.length === 0) return [];
 
     const docs: IRDocument[] = [];
+    const seenUrls = new Set<string>();
     for (const row of rows) {
       const headline = row.HEADLINE ?? "";
       const category = classifyFiling(headline);
@@ -282,6 +293,8 @@ export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
       const { fiscalYear, quarter } = extractPeriod(headline);
       const filename = row.ATTACHMENTNAME ?? "";
       const url2 = buildDocUrl(row);
+      if (seenUrls.has(url2)) continue;
+      seenUrls.add(url2);
 
       docs.push({
         category,

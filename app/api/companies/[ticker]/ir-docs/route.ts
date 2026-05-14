@@ -186,24 +186,16 @@ export async function GET(
     docs.push(...nseAnnouncementsResult.value);
   }
 
-  // 5. BSE filings — only keep investor-presentation, concall, kpi-handbook.
-  //    NSE is now authoritative for quarterly-results and annual-report.
+  // 5. BSE filings — investor presentations, concalls, KPIs always added.
+  //    For quarterly-results and annual-report we keep BSE rows alongside
+  //    NSE rows: BSE attachments are the actual PDFs that issuers upload, and
+  //    NSE often only provides the iXBRL HTML / XML link. Dedup downstream
+  //    handles exact URL collisions.
   const bseCodeValue = bseCode.status === "fulfilled" ? bseCode.value : null;
   if (bseCodeValue) {
     const bseDocs = await fetchBSEFilings(bseCodeValue);
     bseDocsFetchedCount = bseDocs.length;
-
-    // BSE is primary for presentations/concalls/KPIs.
-    // For quarterly-results and annual-report, prefer NSE but fall back to BSE
-    // when NSE returned nothing (e.g., bot-blocked in production).
-    const nseHasQuarterly = docs.some((d) => d.category === "quarterly-results");
-    const nseHasAnnual = docs.some((d) => d.category === "annual-report");
-
-    for (const d of bseDocs) {
-      if (d.category === "quarterly-results" && nseHasQuarterly) continue;
-      if (d.category === "annual-report" && nseHasAnnual) continue;
-      docs.push(d);
-    }
+    docs.push(...bseDocs);
   }
 
   const appOrigin = getCanonicalAppOrigin(request.url);
