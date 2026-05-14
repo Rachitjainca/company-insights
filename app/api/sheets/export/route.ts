@@ -1279,43 +1279,102 @@ async function appendDocumentRows(
       headers.push("Extracted Content");
     }
 
+    const needsExtraction = createGoogleDocs || includeContent;
+
+    // ── Phase 1: prep work in parallel ────────────────────────────────────
+    // The expensive per-document operations (PDF download + positional
+    // extraction + Drive multipart upload + Doc creation) are independent
+    // and can run concurrently. Sheet writes still happen serially below to
+    // preserve row order and keep tab-create batchUpdates conflict-free.
+    const PREP_CONCURRENCY = 4;
+
+    interface PrepResult {
+      doc: ExportDocument;
+      extracted: {
+        docText: string;
+        status: string;
+        tables: ExtractedTable[];
+        convertedFileId?: string;
+      } | null;
+      createdDocUrl: string;
+      createdDocStatus: string;
+      docCreated: boolean;
+    }
+
+    const prepOne = async (doc: ExportDocument): Promise<PrepResult> => {
+      const extracted = needsExtraction
+        ? await buildGoogleDocContentForDocument(accessToken, data, doc)
+        : null;
+
+      let createdDocUrl = "";
+      let createdDocStatus = createGoogleDocs ? "doc-pending" : "doc-disabled";
+      let docCreated = false;
+
+      if (createGoogleDocs && extracted) {
+        const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
+        if (extracted.convertedFileId) {
+          const renamed = await renameDriveFile(
+            accessToken,
+            extracted.convertedFileId,
+            safeTitle
+          );
+          createdDocUrl = `https://docs.google.com/document/d/${extracted.convertedFileId}/edit`;
+          createdDocStatus = renamed
+            ? `${extracted.status}+native-tables`
+            : `${extracted.status}+native-tables (rename-failed)`;
+          docCreated = true;
+        } else {
+          const made = await createGoogleDoc(accessToken, safeTitle, extracted.docText);
+          if (made.url) {
+            createdDocUrl = made.url;
+            createdDocStatus = extracted.status;
+            docCreated = true;
+          } else {
+            createdDocStatus = `doc-create-failed-${made.status}`;
+          }
+        }
+      } else if (extracted?.convertedFileId && !createGoogleDocs) {
+        // Not creating a Doc — clean up the helper file.
+        await deleteDriveFile(accessToken, extracted.convertedFileId);
+      }
+
+      return { doc, extracted, createdDocUrl, createdDocStatus, docCreated };
+    };
+
+    // Run prep in fixed-concurrency batches.
+    const prepped: PrepResult[] = new Array(data.documents.length);
+    for (let start = 0; start < data.documents.length; start += PREP_CONCURRENCY) {
+      const slice = data.documents.slice(start, start + PREP_CONCURRENCY);
+      const results = await Promise.all(slice.map((d) => prepOne(d)));
+      results.forEach((r, i) => {
+        prepped[start + i] = r;
+      });
+    }
+
+    // ── Phase 2: commit results serially (sheet tabs + row append) ────────
     const rows: string[][] = [];
     let docsCreated = 0;
     let tabsCreated = 0;
     const usedTabTitles = new Set<string>();
 
-    for (const doc of data.documents) {
+    for (const p of prepped) {
+      const doc = p.doc;
       const period = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" · ");
-      let googleDocUrl = "";
-      let docStatus = createGoogleDocs ? "doc-pending" : "doc-disabled";
-      let sheetContent = "";
       let tablesTabLabel = "";
+      let sheetContent = "";
 
-      const needsExtraction = createGoogleDocs || includeContent;
-
-      let extracted:
-        | {
-            docText: string;
-            status: string;
-            tables: ExtractedTable[];
-            convertedFileId?: string;
-          }
-        | null = null;
-      if (needsExtraction) {
-        extracted = await buildGoogleDocContentForDocument(accessToken, data, doc);
-        if (includeContent) {
-          sheetContent = toSheetContent(extracted.docText);
-        }
+      if (p.extracted && includeContent) {
+        sheetContent = toSheetContent(p.extracted.docText);
       }
 
-      // Write extracted tables into a dedicated sheet tab so the user gets a
-      // tabular view of the financial data (not just text in a cell).
-      if (extracted && extracted.tables.length > 0) {
+      // Write extracted tables into a dedicated tab (sequential — tab creation
+      // requires unique titles tracked across the whole export).
+      if (p.extracted && p.extracted.tables.length > 0) {
         const result = await writeTablesAsSheetTabs(
           accessToken,
           spreadsheetId,
           doc,
-          extracted.tables,
+          p.extracted.tables,
           usedTabTitles
         );
         tabsCreated += result.tabsCreated;
@@ -1324,44 +1383,7 @@ async function appendDocumentRows(
         }
       }
 
-      if (createGoogleDocs) {
-        const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
-        const content =
-          extracted ??
-          (await buildGoogleDocContentForDocument(accessToken, data, doc));
-
-        // Preferred path: re-use the Drive-converted Doc as the final result
-        // so native table structure is preserved. Otherwise fall back to a
-        // plain-text Google Doc created via Drive multipart upload.
-        if (content.convertedFileId) {
-          const renamed = await renameDriveFile(
-            accessToken,
-            content.convertedFileId,
-            safeTitle
-          );
-          googleDocUrl = `https://docs.google.com/document/d/${content.convertedFileId}/edit`;
-          docsCreated += 1;
-          docStatus = renamed
-            ? `${content.status}+native-tables`
-            : `${content.status}+native-tables (rename-failed)`;
-        } else {
-          const createdDoc = await createGoogleDoc(
-            accessToken,
-            safeTitle,
-            content.docText
-          );
-          if (createdDoc.url) {
-            googleDocUrl = createdDoc.url;
-            docsCreated += 1;
-            docStatus = content.status;
-          } else {
-            docStatus = `doc-create-failed-${createdDoc.status}`;
-          }
-        }
-      } else if (extracted?.convertedFileId) {
-        // Not creating a Doc — clean up the helper file we created.
-        await deleteDriveFile(accessToken, extracted.convertedFileId);
-      }
+      if (p.docCreated) docsCreated += 1;
 
       rows.push([
         data.company.name,
@@ -1370,8 +1392,8 @@ async function appendDocumentRows(
         period,
         doc.title,
         doc.url,
-        googleDocUrl,
-        docStatus,
+        p.createdDocUrl,
+        p.createdDocStatus,
         tablesTabLabel,
         doc.source ? String(doc.source).toUpperCase() : "",
       ]);

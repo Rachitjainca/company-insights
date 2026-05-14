@@ -262,22 +262,29 @@ export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
       `&strToDate=${today}&strType=C&strSearch=${search}`;
 
     const MAX_PAGES = 5;
-    const rows: BSEFilingRaw[] = [];
 
-    // Walk pages with the primary `strSearch=P` filter.
-    for (let p = 1; p <= MAX_PAGES; p += 1) {
-      const data = await fetchBSEJsonWithRetry(buildUrl(p, "P"));
-      if (!data?.Table || data.Table.length === 0) break;
-      rows.push(...data.Table);
+    // Try the primary `strSearch=P` filter across all pages in parallel.
+    // BSE's per-page latency is ~200-400ms; serial walking added 1-2s.
+    let rows: BSEFilingRaw[] = [];
+
+    const primaryPages = await Promise.all(
+      Array.from({ length: MAX_PAGES }, (_, i) =>
+        fetchBSEJsonWithRetry(buildUrl(i + 1, "P"))
+      )
+    );
+    for (const data of primaryPages) {
+      if (data?.Table && data.Table.length > 0) rows.push(...data.Table);
     }
 
-    // Fall back to the unfiltered feed if the primary returned nothing
-    // (BSE sometimes flips the `strSearch` semantics).
+    // Fall back to the unfiltered feed if the primary returned nothing.
     if (rows.length === 0) {
-      for (let p = 1; p <= MAX_PAGES; p += 1) {
-        const data = await fetchBSEJsonWithRetry(buildUrl(p, ""));
-        if (!data?.Table || data.Table.length === 0) break;
-        rows.push(...data.Table);
+      const fallbackPages = await Promise.all(
+        Array.from({ length: MAX_PAGES }, (_, i) =>
+          fetchBSEJsonWithRetry(buildUrl(i + 1, ""))
+        )
+      );
+      for (const data of fallbackPages) {
+        if (data?.Table && data.Table.length > 0) rows.push(...data.Table);
       }
     }
 
