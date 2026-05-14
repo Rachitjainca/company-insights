@@ -620,10 +620,12 @@ async function writeTablesAsSheetTabs(
   spreadsheetId: string,
   doc: ExportDocument,
   tables: ExtractedTable[],
-  usedTabTitles: Set<string>
+  usedTabTitles: Set<string>,
+  extractedText: string = ""
 ): Promise<{ tabsCreated: number; tabTitles: string[] }> {
   const created: string[] = [];
-  if (tables.length === 0) return { tabsCreated: 0, tabTitles: [] };
+  const hasText = extractedText.trim().length > 0;
+  if (tables.length === 0 && !hasText) return { tabsCreated: 0, tabTitles: [] };
 
   // Build a base tab title from doc context.
   const periodPart = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" ");
@@ -653,7 +655,10 @@ async function writeTablesAsSheetTabs(
   values.push([doc.title]);
   values.push([`Source: ${doc.url}`]);
   if (periodPart) values.push([`Period: ${periodPart}`]);
-  values.push([`Extracted: ${tables.length} financial table${tables.length !== 1 ? "s" : ""}`]);
+  values.push([
+    `Extracted: ${tables.length} financial table${tables.length !== 1 ? "s" : ""}` +
+      (hasText ? ` · ${extractedText.length.toLocaleString()} chars of text` : ""),
+  ]);
   values.push([]);
 
   // Track which row is the first detected table's header (to bold + freeze).
@@ -671,6 +676,28 @@ async function writeTablesAsSheetTabs(
     }
     values.push([]);
   });
+
+  // Append the full extracted text below the tables, one paragraph per row,
+  // so analysts see the same data both as structured tables and as readable
+  // narrative — instead of one giant single-cell blob.
+  if (hasText) {
+    values.push(["── Extracted Text ──"]);
+    const paragraphs = extractedText
+      .split(/\n+/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    for (const p of paragraphs) {
+      // Sheets cell limit is 50,000 chars — chunk anything pathologically long.
+      if (p.length <= 45000) {
+        values.push([p]);
+      } else {
+        for (let i = 0; i < p.length; i += 45000) {
+          values.push([p.slice(i, i + 45000)]);
+        }
+      }
+    }
+    values.push([]);
+  }
 
   const ok = await appendValuesToTab(accessToken, spreadsheetId, tab.title, values);
   if (!ok) return { tabsCreated: 0, tabTitles: [] };
@@ -1482,23 +1509,40 @@ async function appendDocumentRows(
       let tablesTabLabel = "";
       let sheetContent = "";
 
-      if (p.extracted && includeContent) {
-        sheetContent = toSheetContent(p.extracted.docText);
-      }
+      const extractedText =
+        p.extracted && includeContent ? toSheetContent(p.extracted.docText) : "";
 
-      // Write extracted tables into a dedicated tab (sequential — tab creation
-      // requires unique titles tracked across the whole export).
-      if (p.extracted && p.extracted.tables.length > 0) {
+      // Write extracted tables AND (when includeContent is on) the extracted
+      // text into a dedicated per-doc tab — every paragraph and every table
+      // row lands in its own cell, so users get real tabular data instead of
+      // one wall-of-text cell on the index sheet. Tab creation is sequential
+      // because tab titles must be unique across the export.
+      const tablesAvail = p.extracted ? p.extracted.tables : [];
+      if (tablesAvail.length > 0 || extractedText.length > 0) {
         const result = await writeTablesAsSheetTabs(
           accessToken,
           spreadsheetId,
           doc,
-          p.extracted.tables,
-          usedTabTitles
+          tablesAvail,
+          usedTabTitles,
+          extractedText
         );
         tabsCreated += result.tabsCreated;
         if (result.tabTitles.length > 0) {
           tablesTabLabel = result.tabTitles.join(", ");
+        }
+      }
+
+      // The index-sheet "Extracted Content" column now points at the per-doc
+      // tab (or carries a short note if extraction yielded nothing) instead
+      // of holding a multi-thousand-char single-cell blob.
+      if (includeContent) {
+        if (tablesTabLabel) {
+          sheetContent = `See tab: ${tablesTabLabel}`;
+        } else if (p.extracted) {
+          sheetContent = p.extracted.docText
+            ? "(no tables / text extraction unavailable)"
+            : `(extraction status: ${p.createdDocStatus})`;
         }
       }
 
