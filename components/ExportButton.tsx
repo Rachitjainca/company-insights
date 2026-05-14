@@ -110,18 +110,25 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
   const disabled = loading || selectedDocs.length === 0;
 
   return (
-    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6">
-      <div className="flex items-start justify-between gap-4 mb-4">
-        <div>
-          <h3 className="font-semibold text-gray-900">Export to Google Sheets</h3>
-          <p className="text-xs text-gray-400 mt-0.5">
+    <div className="bg-white rounded-2xl border border-slate-200/70 shadow-sm p-6">
+      <div className="flex items-start justify-between gap-4 mb-5">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 ring-1 ring-inset ring-emerald-100">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2a4 4 0 014-4h4M9 17H5a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v6m-6 6l3 3m0 0l-3 3m3-3H9" />
+              </svg>
+            </span>
+            <h3 className="font-semibold text-slate-900 tracking-tight">Export to Google Sheets</h3>
+          </div>
+          <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
             {selectedDocs.length === 0
-              ? "Select documents above to enable export."
-              : `${selectedDocs.length} document${selectedDocs.length !== 1 ? "s" : ""} selected`}
+              ? "Select one or more documents below to enable export. A new spreadsheet will be created in your Google Drive."
+              : `Ready to export ${selectedDocs.length} document${selectedDocs.length !== 1 ? "s" : ""} — a new spreadsheet will be created in your Google Drive.`}
           </p>
         </div>
         {selectedDocs.length > 0 && (
-          <span className="flex-none inline-flex items-center justify-center w-7 h-7 rounded-full bg-blue-600 text-white text-xs font-bold">
+          <span className="flex-none inline-flex items-center justify-center min-w-[28px] h-7 px-2 rounded-full bg-indigo-600 text-white text-xs font-semibold">
             {selectedDocs.length}
           </span>
         )}
@@ -147,10 +154,10 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
             />
           )}
           {!effectiveXbrlMode && (
-            <div className="px-3.5 py-3 rounded-xl border border-gray-200 bg-gray-50 text-xs text-gray-600 leading-relaxed">
+            <div className="px-3.5 py-3 rounded-xl border border-slate-200 bg-slate-50 text-xs text-slate-600 leading-relaxed">
               {includeContent
-                ? "Metadata export writes links and extracted financial/KPI content into the sheet, and also creates a Google Doc."
-                : "Metadata export writes links in the sheet: source file URL + Google Doc URL. The Google Doc is populated with financial and key KPI tables when available."}
+                ? "Each row in the sheet will include the source URL, a generated Google Doc URL, and the extracted financial / KPI text. Best for offline review and downstream analysis."
+                : "Each row in the sheet will include the source URL and a generated Google Doc URL. The Doc is populated with extracted financial and KPI tables when available — ideal for lighter exports."}
             </div>
           )}
         </div>
@@ -160,7 +167,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
         onClick={handleExport}
         disabled={disabled}
         title={selectedDocs.length === 0 ? "Select documents to export" : undefined}
-        className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed font-semibold text-sm transition-colors shadow-sm"
+        className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 bg-gradient-to-br from-indigo-600 to-blue-600 text-white rounded-xl hover:from-indigo-700 hover:to-blue-700 active:from-indigo-800 active:to-blue-800 disabled:opacity-50 disabled:cursor-not-allowed disabled:from-slate-400 disabled:to-slate-400 font-semibold text-sm transition-all shadow-sm hover:shadow ring-1 ring-inset ring-white/10"
       >
         {loading ? (
           <>
@@ -230,8 +237,8 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
       )}
 
       {!isAuthenticated && (
-        <p className="mt-3 text-xs text-gray-400">
-          Requires a one-time Google OAuth authorisation.
+        <p className="mt-3 text-xs text-slate-400">
+          Requires a one-time Google authorisation. We only request access to create the spreadsheet and Doc — no other Drive files are read.
         </p>
       )}
     </div>

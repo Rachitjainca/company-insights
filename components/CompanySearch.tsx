@@ -142,9 +142,9 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
               ? "Loading NSE stock list…"
               : listError
               ? "Stock list unavailable"
-              : "Search by symbol or company name (e.g. TCS, RELIANCE, PAYTM)"
+              : "Search by symbol or company name · e.g. TCS, RELIANCE, PAYTM"
           }
-          className="w-full pl-12 pr-4 py-4 text-base border-2 border-gray-200 rounded-2xl shadow-sm focus:outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100 transition-all bg-white"
+          className="w-full pl-12 pr-12 py-4 text-base text-slate-900 placeholder:text-slate-400 border border-slate-200 rounded-2xl shadow-lg shadow-slate-900/10 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/20 transition-all bg-white"
         />
 
         {query && (
@@ -201,14 +201,14 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
 
       {/* Popular quick picks */}
       {!query && !listLoading && !listError && (
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <span className="text-xs text-gray-400 font-medium">Popular:</span>
+        <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+          <span className="text-[11px] uppercase tracking-[0.14em] text-slate-300 font-medium">Popular</span>
           {POPULAR_SYMBOLS.map((sym) => (
             <button
               key={sym}
               type="button"
               onClick={() => handleQuickPick(sym)}
-              className="text-xs font-mono font-semibold px-2.5 py-1 rounded-lg bg-white border border-gray-200 text-gray-600 hover:border-blue-400 hover:text-blue-700 hover:bg-blue-50 transition-all"
+              className="text-xs font-mono font-semibold px-2.5 py-1 rounded-lg bg-white/10 backdrop-blur-sm ring-1 ring-inset ring-white/15 text-slate-100 hover:bg-white hover:text-indigo-700 hover:ring-white transition-all"
             >
               {sym}
             </button>
