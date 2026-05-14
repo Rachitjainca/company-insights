@@ -841,6 +841,107 @@ const CATEGORY_LABELS: Record<string, string> = {
 const FINANCIAL_KPI_RE =
   /revenue|income|expense|ebitda|ebit|pbt|pat|profit|loss|eps|margin|cash\s*flow|asset|liabilit|debt|borrow|capex|kpi|key\s*performance|operat(?:ing|ional)|volume|utili[sz]ation|subscriber|arpu|aov|order|guidance|roe|roa|roce|gnpa|nnpa|aum/i;
 
+type QuarterlyStatementKind =
+  | "income-statement"
+  | "balance-sheet"
+  | "cash-flow";
+
+const INCOME_STATEMENT_PATTERNS: RegExp[] = [
+  /statement\s+of\s+profit\s+and\s+loss/i,
+  /profit\s+and\s+loss/i,
+  /income\s+statement/i,
+  /revenue\s+from\s+operations/i,
+  /profit\s+before\s+tax|profit\s+for\s+the\s+period/i,
+];
+
+const BALANCE_SHEET_PATTERNS: RegExp[] = [
+  /balance\s+sheet/i,
+  /statement\s+of\s+assets\s+and\s+liabilities/i,
+  /assets\s+and\s+liabilities/i,
+  /total\s+assets|total\s+equity|total\s+liabilities/i,
+  /non-?current\s+assets|current\s+assets/i,
+];
+
+const CASH_FLOW_PATTERNS: RegExp[] = [
+  /cash\s+flow\s+statement|statement\s+of\s+cash\s+flows/i,
+  /net\s+cash\s+from\s+operating\s+activities/i,
+  /cash\s+from\s+investing\s+activities/i,
+  /cash\s+from\s+financing\s+activities/i,
+  /cash\s+and\s+cash\s+equivalents/i,
+];
+
+const NON_STATEMENT_TABLE_RE =
+  /key\s*ratio|ratios?\b|kpi|key\s+performance|operating\s+metric|operational\s+highlight|segment\b|shareholding|notes?\s+to\s+(?:accounts|financial)|note\s+no\.?|annexure|business\s+update|subscriber|arpu|aov|gmv|tpv/i;
+
+function scorePatternHits(text: string, patterns: RegExp[]): number {
+  return patterns.reduce((score, re) => (re.test(text) ? score + 1 : score), 0);
+}
+
+function tableTextForClassification(table: ExtractedTable): string {
+  const leadRows = table.rows.slice(0, 18).map((row) => row.join(" "));
+  return normalizeWhitespace([table.caption, ...leadRows].join("\n")).toLowerCase();
+}
+
+function classifyQuarterlyStatementTable(
+  table: ExtractedTable
+): QuarterlyStatementKind | null {
+  if (table.rows.length < 4) return null;
+  const maxCols = table.rows.reduce((m, r) => Math.max(m, r.length), 0);
+  if (maxCols < 3) return null;
+
+  const text = tableTextForClassification(table);
+  if (!text) return null;
+
+  const incomeScore = scorePatternHits(text, INCOME_STATEMENT_PATTERNS);
+  const balanceScore = scorePatternHits(text, BALANCE_SHEET_PATTERNS);
+  const cashScore = scorePatternHits(text, CASH_FLOW_PATTERNS);
+
+  const ranked: Array<{ kind: QuarterlyStatementKind; score: number }> = [
+    { kind: "income-statement", score: incomeScore },
+    { kind: "balance-sheet", score: balanceScore },
+    { kind: "cash-flow", score: cashScore },
+  ];
+  ranked.sort((a, b) => b.score - a.score);
+
+  const best = ranked[0];
+  if (!best || best.score <= 0) return null;
+
+  // Ratio/KPI/notes tables can carry some financial keywords but are not
+  // statement tables. Keep them out unless a strong statement signal exists.
+  if (NON_STATEMENT_TABLE_RE.test(text) && best.score < 2) {
+    return null;
+  }
+
+  return best.kind;
+}
+
+function filterQuarterlyStatementTables(tables: ExtractedTable[]): ExtractedTable[] {
+  if (tables.length === 0) return [];
+
+  const classified = tables
+    .map((table) => ({ table, kind: classifyQuarterlyStatementTable(table) }))
+    .filter(
+      (item): item is { table: ExtractedTable; kind: QuarterlyStatementKind } =>
+        item.kind !== null
+    );
+
+  if (classified.length === 0) return [];
+
+  const deduped: ExtractedTable[] = [];
+  const seen = new Set<string>();
+
+  for (const item of classified) {
+    const header = normalizeWhitespace((item.table.rows[0] ?? []).join("|")).toLowerCase();
+    const key = `${item.kind}:${header}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item.table);
+    if (deduped.length >= 12) break;
+  }
+
+  return deduped;
+}
+
 const CONCALL_TOPIC_PATTERNS: Array<{ topic: string; re: RegExp }> = [
   {
     topic: "Guidance / Outlook",
@@ -1516,9 +1617,14 @@ async function buildGoogleDocContentForDocument(
   // 2) Direct PDF positional extraction — produces real cell-level tables.
   //    This is the ONLY path that reliably gets PDF tables into Sheet cells.
   const pdfResult = await tryPositionalPdfTables(doc);
-  if (pdfResult && pdfResult.tables.length > 0) {
+  const pdfTables =
+    doc.category === "quarterly-results" && pdfResult
+      ? filterQuarterlyStatementTables(pdfResult.tables)
+      : pdfResult?.tables ?? [];
+
+  if (pdfResult && pdfTables.length > 0) {
     const tableTextLines: string[] = [];
-    for (const t of pdfResult.tables.slice(0, 6)) {
+    for (const t of pdfTables.slice(0, 6)) {
       tableTextLines.push(`\n${t.caption}`);
       for (const row of t.rows.slice(0, 30)) {
         tableTextLines.push(row.join("\t"));
@@ -1533,8 +1639,11 @@ async function buildGoogleDocContentForDocument(
           ...tableTextLines,
         ].join("\n")
       ),
-      status: `ok-pdf-positional-${pdfResult.tables.length}-tables`,
-      tables: pdfResult.tables,
+      status:
+        doc.category === "quarterly-results"
+          ? `ok-pdf-positional-${pdfTables.length}-statement-tables`
+          : `ok-pdf-positional-${pdfTables.length}-tables`,
+      tables: pdfTables,
     };
   }
 
@@ -1572,6 +1681,10 @@ async function buildGoogleDocContentForDocument(
         `${data.company.symbol} - ${doc.title}`.slice(0, 120),
         doc.url
       );
+      const convertedTables =
+        doc.category === "quarterly-results"
+          ? filterQuarterlyStatementTables(converted.tables)
+          : converted.tables;
       return {
         docText: toDocText(
           [
@@ -1582,7 +1695,7 @@ async function buildGoogleDocContentForDocument(
           ].join("\n")
         ),
         status: `ok-filtered-${extracted.status}`,
-        tables: converted.tables,
+        tables: convertedTables,
         convertedFileId: converted.convertedFileId,
       };
     }
@@ -1622,6 +1735,10 @@ async function buildGoogleDocContentForDocument(
   if (converted.extractedText) {
     const filtered = extractFinancialKpiText(converted.extractedText);
     if (filtered) {
+      const convertedTables =
+        doc.category === "quarterly-results"
+          ? filterQuarterlyStatementTables(converted.tables)
+          : converted.tables;
       return {
         docText: toDocText(
           [
@@ -1632,11 +1749,16 @@ async function buildGoogleDocContentForDocument(
           ].join("\n")
         ),
         status: `ok-filtered-${converted.status}`,
-        tables: converted.tables,
+        tables: convertedTables,
         convertedFileId: converted.convertedFileId,
       };
     }
   }
+
+  const fallbackTables =
+    doc.category === "quarterly-results"
+      ? filterQuarterlyStatementTables(converted.tables)
+      : converted.tables;
 
   return {
     docText: toDocText(
@@ -1647,7 +1769,7 @@ async function buildGoogleDocContentForDocument(
       ].join("\n")
     ),
     status: `no-financial-kpi-${converted.status || extracted.status}`,
-    tables: converted.tables,
+    tables: fallbackTables,
     convertedFileId: converted.convertedFileId,
   };
 }
@@ -1752,7 +1874,21 @@ async function appendDocumentRows(
         }
 
         if (!createdFinancialOnly) {
-          if (extracted.convertedFileId) {
+          // Strict mode for quarterly results: never hand back the full
+          // converted source Doc, because it may include non-statement tables.
+          if (doc.category === "quarterly-results") {
+            if (extracted.convertedFileId) {
+              await deleteDriveFile(accessToken, extracted.convertedFileId);
+            }
+            const made = await createGoogleDoc(accessToken, safeTitle, extracted.docText);
+            if (made.url) {
+              createdDocUrl = made.url;
+              createdDocStatus = `${extracted.status}+statement-only-fallback-text`;
+              docCreated = true;
+            } else {
+              createdDocStatus = `doc-create-failed-${made.status}`;
+            }
+          } else if (extracted.convertedFileId) {
             const renamed = await renameDriveFile(
               accessToken,
               extracted.convertedFileId,
