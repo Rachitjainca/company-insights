@@ -1789,6 +1789,22 @@ async function appendDocumentRows(
   data: ExportRequest
 ): Promise<DocumentAppendResult> {
   try {
+    const normalizeNativeTablesDocStatus = (rawStatus: string): string => {
+      // If Drive conversion created a usable native-table Doc but text/html
+      // exports failed (common on very large decks), treat this as success.
+      const status = rawStatus.toLowerCase();
+      if (status.includes("doc-export-failed-text-") || status.includes("doc-export-unavailable-text-")) {
+        return "ok-native-tables-only";
+      }
+      if (status.startsWith("no-financial-kpi-")) {
+        const tail = status.replace(/^no-financial-kpi-/, "");
+        if (tail.includes("doc-created-empty-text") || tail.includes("ok-via-doc-conversion")) {
+          return "ok-native-tables-fallback";
+        }
+      }
+      return rawStatus;
+    };
+
     const createGoogleDocs = data.createGoogleDocs !== false;
     const includeContent = data.includeContent === true;
 
@@ -1894,10 +1910,11 @@ async function appendDocumentRows(
               extracted.convertedFileId,
               safeTitle
             );
+            const baseStatus = normalizeNativeTablesDocStatus(extracted.status);
             createdDocUrl = `https://docs.google.com/document/d/${extracted.convertedFileId}/edit`;
             createdDocStatus = renamed
-              ? `${extracted.status}+native-tables`
-              : `${extracted.status}+native-tables (rename-failed)`;
+              ? `${baseStatus}+native-tables`
+              : `${baseStatus}+native-tables (rename-failed)`;
             docCreated = true;
           } else {
             const made = await createGoogleDoc(accessToken, safeTitle, extracted.docText);
