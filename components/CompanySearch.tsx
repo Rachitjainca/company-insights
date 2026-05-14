@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { NSEEquity } from "@/types/financial";
+import { resolveBrandAlias } from "@/lib/company-brand";
+import CompanyLogo from "@/components/CompanyLogo";
 
 interface CompanySearchProps {
   onSelect: (equity: NSEEquity) => void;
@@ -88,13 +90,27 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
       return;
     }
     const q = val.trim().toLowerCase();
-    const matches = equities
+    // Brand alias resolution — e.g. "zomato" -> ETERNAL, "jio" -> RELIANCE.
+    const aliasSymbol = resolveBrandAlias(q);
+    const direct = equities
       .filter(
         (s) =>
           s.symbol.toLowerCase().startsWith(q) ||
           s.name.toLowerCase().includes(q)
       )
       .slice(0, 10);
+    let matches = direct;
+    if (aliasSymbol) {
+      const aliased = equities.find(
+        (s) => s.symbol.toUpperCase() === aliasSymbol.toUpperCase()
+      );
+      if (aliased) {
+        matches = [
+          aliased,
+          ...direct.filter((d) => d.symbol !== aliased.symbol),
+        ].slice(0, 10);
+      }
+    }
     setSuggestions(matches);
   };
 
@@ -176,9 +192,12 @@ export default function CompanySearch({ onSelect }: CompanySearchProps) {
                   idx === highlighted ? "bg-blue-50" : "hover:bg-gray-50"
                 } ${idx < suggestions.length - 1 ? "border-b border-gray-100" : ""}`}
               >
-                <span className="inline-flex items-center justify-center w-12 h-8 rounded-lg bg-blue-600 text-white text-xs font-bold shrink-0">
-                  {s.symbol.slice(0, 4)}
-                </span>
+                <CompanyLogo
+                  symbol={s.symbol}
+                  name={s.name}
+                  className="w-10 h-10 rounded-lg"
+                  fallbackInitials={s.symbol.slice(0, 2)}
+                />
                 <div className="min-w-0">
                   <div className="font-semibold text-gray-900 text-sm">
                     {highlight(s.symbol, query)}

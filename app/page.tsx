@@ -4,6 +4,7 @@ import { useState } from "react";
 import CompanySearch from "@/components/CompanySearch";
 import CompanyDocuments from "@/components/CompanyDocuments";
 import ExportButton from "@/components/ExportButton";
+import CompanyLogo from "@/components/CompanyLogo";
 import type { NSEEquity, SelectedDoc } from "@/types/financial";
 
 export default function Home() {
@@ -83,17 +84,18 @@ export default function Home() {
                 <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse shadow-[0_0_8px_rgba(52,211,153,0.8)]" />
                 Live exchange data
               </div>
-              <h1 className="text-4xl sm:text-5xl lg:text-6xl font-semibold tracking-tight mb-5 [text-wrap:balance]">
+              <h1 className="font-serif text-5xl sm:text-6xl lg:text-7xl tracking-tight mb-6 [text-wrap:balance] leading-[1.05]">
                 Indian-listed company research,
                 <br className="hidden sm:block" />
-                <span className="bg-gradient-to-r from-sky-300 via-indigo-200 to-white bg-clip-text text-transparent">
-                  {" "}consolidated and exportable.
+                <span className="italic bg-gradient-to-r from-sky-300 via-indigo-200 to-white bg-clip-text text-transparent">
+                  consolidated and exportable.
                 </span>
               </h1>
+      {/* Hero / Search dropdown placeholder hint */}
               <p className="text-slate-300 text-base sm:text-lg mb-10 max-w-2xl mx-auto leading-relaxed [text-wrap:balance]">
-                Search any NSE or BSE-listed company to retrieve its quarterly results,
-                investor presentations, concall transcripts, annual reports and KPI handbooks
-                from a single, structured workspace — and export the underlying financials to Google Sheets in seconds.
+                Search any NSE or BSE-listed company — by ticker <span className="font-mono text-white">TCS</span>, brand name <span className="font-mono text-white">Zomato</span>, or full legal name —
+                to retrieve quarterly results, investor presentations, concall transcripts and KPI handbooks.
+                Export the underlying financials to Google Sheets in seconds.
               </p>
               <CompanySearch onSelect={handleSelect} />
 
@@ -170,11 +172,13 @@ export default function Home() {
           {/* Company header */}
           <div className="bg-white rounded-2xl border border-slate-200/70 shadow-sm px-6 py-5 flex flex-wrap items-center justify-between gap-4">
             <div className="flex items-center gap-4 min-w-0">
-              <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-700 text-white flex items-center justify-center font-semibold text-sm shrink-0 shadow-sm ring-1 ring-inset ring-white/15 tracking-tight">
-                {selectedCompany.symbol.slice(0, 2)}
-              </div>
+              <CompanyLogo
+                symbol={selectedCompany.symbol}
+                name={selectedCompany.name}
+                className="w-14 h-14 rounded-xl"
+              />
               <div className="min-w-0">
-                <h2 className="text-[17px] font-semibold text-slate-900 leading-tight truncate tracking-tight">
+                <h2 className="font-serif text-2xl sm:text-[26px] text-slate-900 leading-tight truncate tracking-tight">
                   {selectedCompany.name}
                 </h2>
                 <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
