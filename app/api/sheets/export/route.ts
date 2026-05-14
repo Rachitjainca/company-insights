@@ -132,61 +132,95 @@ async function createSpreadsheet(
   }
 }
 
+interface CreateGoogleDocResult {
+  url: string | null;
+  status: string;
+}
+
 /**
- * Create a Google Doc and insert extracted text content.
+ * Create a Google Doc by uploading plain text via the Drive API and letting
+ * Drive convert it to a Google Doc. This avoids dependence on the Docs API
+ * and the `documents` OAuth scope (only `drive.file` is required), while
+ * preserving the same end result (a Google Doc containing the extracted text).
  */
-async function createGoogleDoc(
+async function attemptCreateGoogleDoc(
   accessToken: string,
   title: string,
   content: string
-): Promise<string | null> {
+): Promise<CreateGoogleDocResult> {
   try {
-    const createRes = await fetch("https://docs.googleapis.com/v1/documents", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ title }),
-    });
+    const boundary = `cgi-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const metadata = {
+      name: title,
+      mimeType: "application/vnd.google-apps.document",
+    };
 
-    if (!createRes.ok) {
-      return null;
-    }
+    const body =
+      `--${boundary}\r\n` +
+      `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+      `${JSON.stringify(metadata)}\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Type: text/plain; charset=UTF-8\r\n\r\n` +
+      `${content}\r\n` +
+      `--${boundary}--`;
 
-    const created = await createRes.json();
-    const documentId = created?.documentId as string | undefined;
-    if (!documentId) return null;
-
-    const insertRes = await fetch(
-      `https://docs.googleapis.com/v1/documents/${documentId}:batchUpdate`,
+    const res = await fetch(
+      "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
       {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
+          "Content-Type": `multipart/related; boundary=${boundary}`,
         },
-        body: JSON.stringify({
-          requests: [
-            {
-              insertText: {
-                location: { index: 1 },
-                text: content,
-              },
-            },
-          ],
-        }),
+        body,
       }
     );
 
-    if (!insertRes.ok) {
-      return null;
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      console.error(
+        `createGoogleDoc failed (HTTP ${res.status}):`,
+        errText.slice(0, 500)
+      );
+      return { url: null, status: `http-${res.status}` };
     }
 
-    return `https://docs.google.com/document/d/${documentId}/edit`;
-  } catch {
-    return null;
+    const created = (await res.json().catch(() => null)) as
+      | { id?: string }
+      | null;
+    const fileId = created?.id;
+    if (!fileId) {
+      console.error("createGoogleDoc: response missing file id");
+      return { url: null, status: "missing-id" };
+    }
+
+    return {
+      url: `https://docs.google.com/document/d/${fileId}/edit`,
+      status: "ok",
+    };
+  } catch (error) {
+    console.error("createGoogleDoc error:", error);
+    return { url: null, status: "exception" };
   }
+}
+
+async function createGoogleDoc(
+  accessToken: string,
+  title: string,
+  content: string
+): Promise<{ url: string | null; status: string }> {
+  let last: CreateGoogleDocResult = { url: null, status: "unknown" };
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const result = await attemptCreateGoogleDoc(accessToken, title, content);
+    if (result.url) return result;
+    last = result;
+    // Only retry on transient errors (5xx / network exception).
+    const transient =
+      result.status === "exception" ||
+      /^http-5\d\d$/.test(result.status);
+    if (!transient) break;
+  }
+  return last;
 }
 
 function normalizeWhitespace(text: string): string {
@@ -654,12 +688,12 @@ async function appendDocumentRows(
           (await buildGoogleDocContentForDocument(accessToken, data, doc));
         const createdDoc = await createGoogleDoc(accessToken, safeTitle, content.docText);
 
-        if (createdDoc) {
-          googleDocUrl = createdDoc;
+        if (createdDoc.url) {
+          googleDocUrl = createdDoc.url;
           docsCreated += 1;
           docStatus = content.status;
         } else {
-          docStatus = `doc-create-failed-${content.status}`;
+          docStatus = `doc-create-failed-${createdDoc.status}`;
         }
       }
 
