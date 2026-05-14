@@ -986,30 +986,74 @@ async function attemptSourceTextViaGoogleConversion(
       ),
     ]);
 
-    if (!textRes.ok) {
-      // Best effort: still try HTML; cleanup the file since we can't use it.
-      await deleteDriveFile(accessToken, fileId);
-      return {
-        extractedText: "",
-        status: `doc-created-no-text-export-${textRes.status}`,
-        tables: [],
-      };
+    // First try direct text/plain export. Drive returns 400 / 403 when the
+    // converted Doc exceeds the text-export size limit (~10 MB) — this is
+    // common for investor decks. In that case we fall back to deriving text
+    // from the HTML export, which has a more generous limit. We always keep
+    // the converted file so the caller can still hand the user a Google Doc
+    // with native tables intact.
+    let exportedText = "";
+    let textStatus: "text-ok" | "text-fallback-html" | "text-empty" = "text-empty";
+
+    if (textRes.ok) {
+      exportedText = normalizeWhitespace(await textRes.text());
+      textStatus = exportedText ? "text-ok" : "text-empty";
     }
 
-    const exportedText = normalizeWhitespace(await textRes.text());
     let tables: ExtractedTable[] = [];
+    let htmlBody: string | null = null;
     if (htmlRes.ok) {
       try {
-        const html = await htmlRes.text();
-        tables = extractFinancialTablesFromHtml(html);
+        htmlBody = await htmlRes.text();
+        tables = extractFinancialTablesFromHtml(htmlBody);
       } catch (err) {
         console.error("HTML table parse error:", err);
       }
     }
 
+    if (!exportedText && htmlBody) {
+      // Strip HTML tags + decode common entities for a passable plain-text view.
+      const stripped = normalizeWhitespace(
+        htmlBody
+          .replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<\/(?:p|div|tr|li|h[1-6])>/gi, "\n")
+          .replace(/<br\s*\/?\s*>/gi, "\n")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/&nbsp;/gi, " ")
+          .replace(/&amp;/gi, "&")
+          .replace(/&lt;/gi, "<")
+          .replace(/&gt;/gi, ">")
+          .replace(/&quot;/gi, '"')
+          .replace(/&#39;/gi, "'")
+      );
+      if (stripped) {
+        exportedText = stripped;
+        textStatus = "text-fallback-html";
+      }
+    }
+
+    if (!exportedText && !textRes.ok && !htmlRes.ok) {
+      // Both exports failed — keep the file id so caller can still produce
+      // the renamed Doc. Plain text path is just unavailable.
+      return {
+        extractedText: "",
+        status: `doc-export-failed-text-${textRes.status}-html-${htmlRes.status}`,
+        tables: [],
+        convertedFileId: fileId,
+      };
+    }
+
+    const baseStatus =
+      exportedText && textStatus === "text-fallback-html"
+        ? "ok-via-doc-conversion-html-fallback"
+        : exportedText
+          ? "ok-via-doc-conversion"
+          : "doc-created-empty-text";
+
     return {
       extractedText: toDocText(exportedText),
-      status: exportedText ? "ok-via-doc-conversion" : "doc-created-empty-text",
+      status: baseStatus,
       tables,
       convertedFileId: fileId,
     };
