@@ -1069,6 +1069,44 @@ async function extractSourceTextViaGoogleConversion(
 
 const PDF_FETCH_TIMEOUT_MS = 45000;
 const MAX_PDF_BYTES = 30 * 1024 * 1024; // 30 MB safety cap
+/**
+ * PDFs above this size still get a Drive-conversion fallback (which streams
+ * the upload), but skip the in-memory positional table extraction. Keeps
+ * one giant filing from monopolising a worker slot for ~30s.
+ */
+const POSITIONAL_PDF_BUDGET_BYTES = 12 * 1024 * 1024; // 12 MB
+
+/**
+ * Quick HEAD probe to read content-length / content-type without downloading
+ * the body. Returns `null` when the server doesn't support HEAD or the
+ * request fails — callers should treat that as "size unknown" and proceed.
+ */
+async function probePdfHead(
+  url: string
+): Promise<{ size: number | null; type: string | null } | null> {
+  if (!/^https?:\/\//i.test(url)) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(url, {
+      method: "HEAD",
+      headers: SOURCE_FETCH_HEADERS,
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const cl = Number(res.headers.get("content-length") || "0");
+    return {
+      size: cl > 0 ? cl : null,
+      type: res.headers.get("content-type"),
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function fetchPdfBytes(url: string): Promise<Uint8Array | null> {
   if (!/^https?:\/\//i.test(url)) return null;
@@ -1110,12 +1148,39 @@ async function tryPositionalPdfTables(
   doc: ExportDocument
 ): Promise<{ tables: ExtractedTable[]; text: string; status: string } | null> {
   if (!looksLikePdfUrl(doc.url, doc.type)) return null;
+
+  // Cheap HEAD probe first — if the PDF exceeds the positional-extraction
+  // budget, skip the heavy in-memory parse and let the Drive-conversion
+  // fallback handle it (it streams the upload, no memory pressure).
+  const head = await probePdfHead(doc.url);
+  if (head?.size && head.size > POSITIONAL_PDF_BUDGET_BYTES) {
+    console.warn(
+      `tryPositionalPdfTables skipping large PDF ${head.size}B for ${doc.url}`
+    );
+    return { tables: [], text: "", status: `pdf-too-large-${head.size}` };
+  }
+
   const bytes = await fetchPdfBytes(doc.url);
   if (!bytes) return { tables: [], text: "", status: "pdf-fetch-failed" };
-  const result = await extractTablesFromPdf(bytes, {
+
+  // Hard timeout on the parse itself so a malformed PDF can't stall a slot.
+  const PARSE_TIMEOUT_MS = 30000;
+  const parsePromise = extractTablesFromPdf(bytes, {
     maxPages: 30,
     financialOnly: true,
   });
+  const result = await Promise.race([
+    parsePromise,
+    new Promise<null>((resolve) =>
+      setTimeout(() => resolve(null), PARSE_TIMEOUT_MS)
+    ),
+  ]);
+
+  if (!result) {
+    console.warn(`tryPositionalPdfTables parse timed out for ${doc.url}`);
+    return { tables: [], text: "", status: "pdf-parse-timeout" };
+  }
+
   return {
     tables: result.tables,
     text: result.text,
@@ -1341,14 +1406,24 @@ async function appendDocumentRows(
       return { doc, extracted, createdDocUrl, createdDocStatus, docCreated };
     };
 
-    // Run prep in fixed-concurrency batches.
+    // Run prep through a streaming async pool: as soon as a worker finishes
+    // one document, it picks up the next available index. This means a single
+    // slow PDF only blocks its own slot — the other workers keep flowing.
     const prepped: PrepResult[] = new Array(data.documents.length);
-    for (let start = 0; start < data.documents.length; start += PREP_CONCURRENCY) {
-      const slice = data.documents.slice(start, start + PREP_CONCURRENCY);
-      const results = await Promise.all(slice.map((d) => prepOne(d)));
-      results.forEach((r, i) => {
-        prepped[start + i] = r;
-      });
+    {
+      let nextIndex = 0;
+      const workerCount = Math.min(PREP_CONCURRENCY, data.documents.length);
+      const worker = async () => {
+        while (true) {
+          const i = nextIndex;
+          nextIndex += 1;
+          if (i >= data.documents.length) return;
+          prepped[i] = await prepOne(data.documents[i]);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.max(1, workerCount) }, () => worker())
+      );
     }
 
     // ── Phase 2: commit results serially (sheet tabs + row append) ────────
