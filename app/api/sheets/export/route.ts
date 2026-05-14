@@ -1233,6 +1233,162 @@ function buildGoogleWorkspaceFileUrl(
   }
 }
 
+type GoogleWorkspaceTargetMimeType =
+  | "application/vnd.google-apps.document"
+  | "application/vnd.google-apps.spreadsheet";
+
+interface SourceToGoogleWorkspaceResult {
+  fileId?: string;
+  mimeType?: string;
+  url: string | null;
+  status: string;
+}
+
+async function convertSourceToGoogleWorkspaceFile(
+  accessToken: string,
+  title: string,
+  sourceUrl: string,
+  targetMimeType: GoogleWorkspaceTargetMimeType
+): Promise<SourceToGoogleWorkspaceResult> {
+  if (!/^https?:\/\//i.test(sourceUrl)) {
+    return { url: null, status: "invalid-url" };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SOURCE_CONVERSION_TIMEOUT_MS);
+
+  try {
+    const sourceRes = await fetch(sourceUrl, {
+      method: "GET",
+      headers: SOURCE_FETCH_HEADERS,
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    if (!sourceRes.ok) {
+      return {
+        url: null,
+        status: `source-fetch-failed-${sourceRes.status}`,
+      };
+    }
+
+    const contentLength = Number(sourceRes.headers.get("content-length") || "0");
+    if (contentLength > 0 && contentLength > MAX_SOURCE_FILE_BYTES) {
+      return { url: null, status: "source-too-large" };
+    }
+
+    const sourceMimeType =
+      (sourceRes.headers.get("content-type") || "application/octet-stream")
+        .split(";")[0]
+        .trim();
+
+    let uploadBody: BodyInit;
+    let uploadByteLength = contentLength;
+
+    if (sourceRes.body && contentLength > 0) {
+      uploadBody = sourceRes.body;
+    } else {
+      const sourceBytes = new Uint8Array(await sourceRes.arrayBuffer());
+      if (sourceBytes.byteLength > MAX_SOURCE_FILE_BYTES) {
+        return { url: null, status: "source-too-large" };
+      }
+      uploadBody = sourceBytes;
+      uploadByteLength = sourceBytes.byteLength;
+    }
+
+    const initHeaders: Record<string, string> = {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+      "X-Upload-Content-Type": sourceMimeType,
+    };
+
+    if (uploadByteLength > 0) {
+      initHeaders["X-Upload-Content-Length"] = String(uploadByteLength);
+    }
+
+    const initRes = await fetch(
+      "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,mimeType,webViewLink",
+      {
+        method: "POST",
+        headers: initHeaders,
+        body: JSON.stringify({
+          name: title,
+          mimeType: targetMimeType,
+        }),
+        signal: controller.signal,
+      }
+    );
+
+    if (!initRes.ok) {
+      return {
+        url: null,
+        status: `workspace-conversion-init-failed-${initRes.status}`,
+      };
+    }
+
+    const resumableUrl = initRes.headers.get("location");
+    if (!resumableUrl) {
+      return { url: null, status: "workspace-conversion-session-missing" };
+    }
+
+    const uploadHeaders: Record<string, string> = {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": sourceMimeType,
+    };
+
+    if (uploadByteLength > 0) {
+      uploadHeaders["Content-Length"] = String(uploadByteLength);
+    }
+
+    const uploadRequest: RequestInit & { duplex?: "half" } = {
+      method: "PUT",
+      headers: uploadHeaders,
+      body: uploadBody,
+      signal: controller.signal,
+    };
+
+    if (sourceRes.body && contentLength > 0) {
+      uploadRequest.duplex = "half";
+    }
+
+    const uploadRes = await fetch(resumableUrl, uploadRequest);
+    if (!uploadRes.ok) {
+      return {
+        url: null,
+        status: `workspace-conversion-failed-${uploadRes.status}`,
+      };
+    }
+
+    const uploaded = (await uploadRes.json().catch(() => null)) as
+      | { id?: string; mimeType?: string; webViewLink?: string }
+      | null;
+    const fileId = uploaded?.id;
+
+    if (!fileId) {
+      return { url: null, status: "workspace-file-id-missing" };
+    }
+
+    const mimeType = uploaded?.mimeType || targetMimeType;
+    return {
+      fileId,
+      mimeType,
+      url: buildGoogleWorkspaceFileUrl(fileId, mimeType, uploaded?.webViewLink),
+      status: "ok",
+    };
+  } catch (error) {
+    const isAbort =
+      error instanceof Error &&
+      (error.name === "AbortError" || error.message.toLowerCase().includes("abort"));
+    return {
+      url: null,
+      status: isAbort ? "workspace-conversion-timeout" : "workspace-conversion-error",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function shouldRetrySourceConversion(status: string): boolean {
   if (status === "invalid-url") return false;
   if (status.startsWith("source-too-large")) return false;
@@ -1870,7 +2026,7 @@ async function appendDocumentRows(
       "Period",
       "Title",
       "Source URL",
-      "Google Doc URL",
+      "Google File URL",
       "Doc Status",
       "Tables Tab",
       "Concall Key Insights",
@@ -1920,6 +2076,7 @@ async function appendDocumentRows(
       if (createGoogleDocs && extracted) {
         const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
         let createdFinancialOnly = false;
+        let createdGoogleSheet = false;
 
         // For quarterly-result exports, prefer a financial-only Google Doc built
         // from extracted table grids. This avoids carrying unrelated pages from
@@ -1945,6 +2102,33 @@ async function appendDocumentRows(
         }
 
         if (!createdFinancialOnly) {
+          if (doc.category !== "quarterly-results" && doc.type === "xlsx") {
+            const sheetConversion = await convertSourceToGoogleWorkspaceFile(
+              accessToken,
+              safeTitle,
+              doc.url,
+              "application/vnd.google-apps.spreadsheet"
+            );
+
+            if (sheetConversion.url) {
+              if (
+                extracted.convertedFileId &&
+                extracted.convertedFileId !== sheetConversion.fileId
+              ) {
+                await deleteDriveFile(accessToken, extracted.convertedFileId);
+              }
+              const baseStatus = normalizeNativeTablesDocStatus(extracted.status);
+              createdDocUrl = sheetConversion.url;
+              createdDocStatus = `${baseStatus}+converted-google-sheet`;
+              docCreated = true;
+              createdGoogleSheet = true;
+            }
+          }
+
+          if (createdGoogleSheet) {
+            return { doc, extracted, createdDocUrl, createdDocStatus, docCreated };
+          }
+
           // Strict mode for quarterly results: never hand back the full
           // converted source Doc, because it may include non-statement tables.
           if (doc.category === "quarterly-results") {
@@ -2578,7 +2762,7 @@ export async function POST(request: NextRequest) {
     const rowNoun = exportMode === "xbrl" ? "XBRL filing" : "document";
     const docCreatedSuffix =
       appendResult.docsCreated > 0
-        ? ` and created ${appendResult.docsCreated} Google Doc${appendResult.docsCreated !== 1 ? "s" : ""}`
+        ? ` and created ${appendResult.docsCreated} Google file${appendResult.docsCreated !== 1 ? "s" : ""}`
         : "";
     const tabsCreated =
       "tabsCreated" in appendResult ? (appendResult as DocumentAppendResult).tabsCreated : 0;
