@@ -1,8 +1,11 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #fafaf9;
+  --foreground: #0f172a;
+  --accent: #4f46e5;
+  --muted: #64748b;
+  --border: #e2e8f0;
 }
 
 @theme inline {
@@ -10,13 +13,7 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-serif: var(--font-instrument-serif);
 }
 
 body {
@@ -30,6 +27,14 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+.font-serif,
+.font-display {
+  font-family: var(--font-instrument-serif), ui-serif, Georgia, "Times New Roman",
+    serif;
+  font-feature-settings: "kern", "liga", "calt";
+  letter-spacing: -0.01em;
+}
+
 .font-mono,
 code,
 kbd,
@@ -37,4 +42,27 @@ pre,
 samp {
   font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo,
     Consolas, monospace;
+}
+
+/* Subtle selection styling */
+::selection {
+  background: rgba(79, 70, 229, 0.18);
+  color: inherit;
+}
+
+/* Refined scrollbar (WebKit) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 8px;
+  border: 2px solid var(--background);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
 }

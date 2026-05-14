@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseQuarterlyXBRL, ORDERED_METRICS } from "@/lib/xbrl-parser";
 import { extractDocumentContent } from "@/lib/document-content";
+import { extractTablesFromPdf, type ExtractedTable } from "@/lib/pdf-tables";
+
+// Force the Node.js runtime so unpdf (uses Web APIs + Buffer) works on Vercel.
+export const runtime = "nodejs";
+export const maxDuration = 300;
 
 // NSE headers used when fetching XBRL files server-side
 const NSE_HEADERS: HeadersInit = {
@@ -49,19 +54,16 @@ interface ExportRequest {
   createGoogleDocs?: boolean;
   /** When true, write extracted finance/KPI content into a sheet column for metadata mode. */
   includeContent?: boolean;
+  /** When true, append a comparative XBRL repository tab pivoting metrics
+   *  across all selected quarters (works in any export mode if quarterly XBRL
+   *  filings are present in the selection). */
+  includeXbrlComparative?: boolean;
 }
 
 interface AppendResult {
   ok: boolean;
   rowsWritten: number;
   docsCreated: number;
-}
-
-interface ExtractedTable {
-  /** 2-D string grid of cell values (header row first when detectable). */
-  rows: string[][];
-  /** Heuristic label so users can identify a table in the spreadsheet. */
-  caption: string;
 }
 
 interface SourceTextResult {
@@ -950,6 +952,66 @@ async function extractSourceTextViaGoogleConversion(
   return lastResult;
 }
 
+/* ──────────────────────────────────────────────────────────────────────── */
+/*  Direct PDF table extraction via positional clustering (unpdf)           */
+/* ──────────────────────────────────────────────────────────────────────── */
+
+const PDF_FETCH_TIMEOUT_MS = 45000;
+const MAX_PDF_BYTES = 30 * 1024 * 1024; // 30 MB safety cap
+
+async function fetchPdfBytes(url: string): Promise<Uint8Array | null> {
+  if (!/^https?:\/\//i.test(url)) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: SOURCE_FETCH_HEADERS,
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.error(`fetchPdfBytes HTTP ${res.status} for ${url}`);
+      return null;
+    }
+    const cl = Number(res.headers.get("content-length") || "0");
+    if (cl > 0 && cl > MAX_PDF_BYTES) {
+      console.error(`fetchPdfBytes too large (${cl}B) for ${url}`);
+      return null;
+    }
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > MAX_PDF_BYTES) return null;
+    return new Uint8Array(buf);
+  } catch (err) {
+    console.error("fetchPdfBytes error:", err);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function looksLikePdfUrl(url: string, type?: string): boolean {
+  if (type && type.toLowerCase() === "pdf") return true;
+  return /\.pdf(?:[?#]|$)/i.test(url);
+}
+
+async function tryPositionalPdfTables(
+  doc: ExportDocument
+): Promise<{ tables: ExtractedTable[]; text: string; status: string } | null> {
+  if (!looksLikePdfUrl(doc.url, doc.type)) return null;
+  const bytes = await fetchPdfBytes(doc.url);
+  if (!bytes) return { tables: [], text: "", status: "pdf-fetch-failed" };
+  const result = await extractTablesFromPdf(bytes, {
+    maxPages: 30,
+    financialOnly: true,
+  });
+  return {
+    tables: result.tables,
+    text: result.text,
+    status: `pdf-${result.status}`,
+  };
+}
+
 async function buildGoogleDocContentForDocument(
   accessToken: string,
   data: ExportRequest,
@@ -960,13 +1022,11 @@ async function buildGoogleDocContentForDocument(
   tables: ExtractedTable[];
   convertedFileId?: string;
 }> {
-  // Prefer taxonomy-based extraction for quarterly result docs with XBRL.
+  // 1) Taxonomy-based extraction for quarterly result docs with XBRL.
   if (doc.category === "quarterly-results" && doc.xbrlUrl) {
     const metrics = await parseQuarterlyXBRL(doc.xbrlUrl, NSE_HEADERS);
     const xbrlDocText = buildXbrlFinancialDoc(data, doc, metrics);
     if (xbrlDocText) {
-      // Build a synthetic table from the metric/value pairs so it shows up in
-      // Sheets too, not only as text.
       const metricRows: string[][] = [["Metric", "Value"]];
       for (const label of ORDERED_METRICS) {
         if (metrics[label] === undefined) continue;
@@ -983,12 +1043,36 @@ async function buildGoogleDocContentForDocument(
     }
   }
 
+  // 2) Direct PDF positional extraction — produces real cell-level tables.
+  //    This is the ONLY path that reliably gets PDF tables into Sheet cells.
+  const pdfResult = await tryPositionalPdfTables(doc);
+  if (pdfResult && pdfResult.tables.length > 0) {
+    const tableTextLines: string[] = [];
+    for (const t of pdfResult.tables.slice(0, 6)) {
+      tableTextLines.push(`\n${t.caption}`);
+      for (const row of t.rows.slice(0, 30)) {
+        tableTextLines.push(row.join("\t"));
+      }
+    }
+    return {
+      docText: toDocText(
+        [
+          buildDocHeader(data, doc),
+          "",
+          "Financial and Key KPI Tables (extracted from PDF)",
+          ...tableTextLines,
+        ].join("\n")
+      ),
+      status: `ok-pdf-positional-${pdfResult.tables.length}-tables`,
+      tables: pdfResult.tables,
+    };
+  }
+
+  // 3) Direct text-only fetch (HTML/XML/plain text resources).
   const extracted = await extractDocumentContent(doc.url);
   if (extracted.fullText) {
     const filtered = extractFinancialKpiText(extracted.fullText);
     if (filtered) {
-      // Direct fetch path doesn't expose tables (PDFs are binary). Still
-      // attempt Drive conversion below so we get tables for the sheet.
       const converted = await extractSourceTextViaGoogleConversion(
         accessToken,
         `${data.company.symbol} - ${doc.title}`.slice(0, 120),
@@ -1010,6 +1094,7 @@ async function buildGoogleDocContentForDocument(
     }
   }
 
+  // 4) Fall back to Drive conversion (preserves native Doc tables when present).
   const converted = await extractSourceTextViaGoogleConversion(
     accessToken,
     `${data.company.symbol} - ${doc.title}`.slice(0, 120),
@@ -1299,6 +1384,173 @@ async function appendXBRLRows(
   }
 }
 
+/* ──────────────────────────────────────────────────────────────────────── */
+/*  XBRL comparative repository — metrics as rows, quarters as columns      */
+/*  (one consolidated sheet for QoQ / YoY analysis across all selected      */
+/*   quarterly filings).                                                    */
+/* ──────────────────────────────────────────────────────────────────────── */
+
+interface QuarterColumn {
+  doc: ExportDocument;
+  metrics: Record<string, number | null>;
+  /** Stable sort key: e.g. "2024-Q3" */
+  sortKey: string;
+  /** Display label: e.g. "Q3 FY24 (Cons)" */
+  label: string;
+}
+
+const QUARTER_ORDER: Record<string, number> = {
+  Q1: 1,
+  Q2: 2,
+  Q3: 3,
+  Q4: 4,
+};
+
+function fyToCalendarYear(fy: string, quarter?: string): number {
+  // FY24 = Apr-23 to Mar-24. Q1 falls in calendar 2023, Q4 in 2024.
+  const m = /(\d{2,4})/.exec(fy ?? "");
+  if (!m) return 0;
+  let yy = parseInt(m[1], 10);
+  if (yy < 100) yy += 2000;
+  const q = (quarter || "").toUpperCase().replace(/\s+/g, "");
+  if (q === "Q1") return yy - 1;
+  if (q === "Q2") return yy - 1;
+  if (q === "Q3") return yy;
+  if (q === "Q4") return yy;
+  return yy;
+}
+
+function buildQuarterSortKey(doc: ExportDocument): string {
+  const calYear = fyToCalendarYear(doc.fiscalYear, doc.quarter);
+  const q = QUARTER_ORDER[(doc.quarter || "").toUpperCase().trim()] ?? 5;
+  return `${calYear.toString().padStart(4, "0")}-${q}`;
+}
+
+function quarterLabel(doc: ExportDocument): string {
+  const consolidated = /Consolidated/i.test(doc.title)
+    ? "Cons"
+    : /Standalone|Non-Consolidated/i.test(doc.title)
+    ? "Std"
+    : "";
+  const period = [doc.quarter, doc.fiscalYear].filter(Boolean).join(" ");
+  return consolidated ? `${period} (${consolidated})` : period;
+}
+
+async function appendXBRLComparativeSheet(
+  accessToken: string,
+  spreadsheetId: string,
+  data: ExportRequest,
+  usedTabTitles: Set<string>
+): Promise<{ ok: boolean; tabsCreated: number; quartersIncluded: number }> {
+  const quarterlyDocs = data.documents.filter(
+    (d) => d.category === "quarterly-results" && d.xbrlUrl
+  );
+  if (quarterlyDocs.length === 0) {
+    return { ok: false, tabsCreated: 0, quartersIncluded: 0 };
+  }
+
+  // Parse all XBRL files in parallel for speed.
+  const columns: QuarterColumn[] = await Promise.all(
+    quarterlyDocs.map(async (doc) => {
+      const metrics = await parseQuarterlyXBRL(doc.xbrlUrl!, NSE_HEADERS);
+      return {
+        doc,
+        metrics,
+        sortKey: buildQuarterSortKey(doc),
+        label: quarterLabel(doc),
+      };
+    })
+  );
+
+  // Sort chronologically (oldest → newest, left → right).
+  columns.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+
+  // Build the comparative grid: header row + one row per metric.
+  const headers: (string | number | null)[] = ["Metric", ...columns.map((c) => c.label)];
+
+  const rows: (string | number | null)[][] = [];
+  for (const metric of ORDERED_METRICS) {
+    const row: (string | number | null)[] = [metric];
+    let hasAny = false;
+    for (const col of columns) {
+      const v = col.metrics[metric];
+      if (v != null) hasAny = true;
+      row.push(v == null || Number.isNaN(v) ? null : Number(v));
+    }
+    if (hasAny) rows.push(row);
+  }
+
+  if (rows.length === 0) {
+    return { ok: false, tabsCreated: 0, quartersIncluded: columns.length };
+  }
+
+  // Build tab title.
+  let title = sanitizeSheetTitle(
+    `${data.company.symbol} · XBRL Comparative`,
+    "XBRL Comparative"
+  );
+  let suffix = 2;
+  while (usedTabTitles.has(title.toLowerCase())) {
+    title = sanitizeSheetTitle(`${data.company.symbol} XBRL Comparative (${suffix})`, "XBRL Comparative");
+    suffix += 1;
+    if (suffix > 50) break;
+  }
+
+  const tab = await addSheetTab(accessToken, spreadsheetId, title);
+  if (!tab) return { ok: false, tabsCreated: 0, quartersIncluded: columns.length };
+  usedTabTitles.add(tab.toLowerCase());
+
+  // Optional context block above the table.
+  const context: (string | number | null)[][] = [
+    [`${data.company.name} (${data.company.symbol}) — XBRL comparative repository`],
+    [
+      `Quarters: ${columns.length} · Metrics: ${rows.length} · Source: NSE Reg-33 XBRL filings`,
+    ],
+    [],
+    headers,
+    ...rows,
+    [],
+    ["QoQ % change (latest two quarters)"],
+  ];
+
+  // QoQ block: only when ≥2 quarters available.
+  if (columns.length >= 2) {
+    const qoqHeader: (string | number | null)[] = ["Metric", "Prev", "Latest", "QoQ %"];
+    context.push(qoqHeader);
+    const last = columns.length - 1;
+    for (const row of rows) {
+      const metric = row[0] as string;
+      const prev = row[last] as number | null; // sheets index of "prev" col is last column
+      // Actually columns are at positions 1..N in row; prev = row[N-1], latest = row[N]
+      const prevVal = row[columns.length - 1] as number | null;
+      const latestVal = row[columns.length] as number | null;
+      let pct: number | string = "";
+      if (
+        typeof prevVal === "number" &&
+        typeof latestVal === "number" &&
+        prevVal !== 0
+      ) {
+        pct = ((latestVal - prevVal) / Math.abs(prevVal)) * 100;
+      }
+      context.push([
+        metric,
+        prevVal,
+        latestVal,
+        typeof pct === "number" ? Number(pct.toFixed(2)) : "",
+      ]);
+      // (avoid unused warning)
+      void prev;
+    }
+  }
+
+  const ok = await appendValuesToTab(accessToken, spreadsheetId, tab, context);
+  return {
+    ok,
+    tabsCreated: ok ? 1 : 0,
+    quartersIncluded: columns.length,
+  };
+}
+
 /**
  * Export financial data to Google Sheets
  */
@@ -1421,6 +1673,20 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Optional: append the XBRL comparative repository tab.
+    let comparativeQuarters = 0;
+    let comparativeTabsCreated = 0;
+    if (companyData.includeXbrlComparative) {
+      const compResult = await appendXBRLComparativeSheet(
+        token,
+        spreadsheetId,
+        companyData,
+        new Set<string>() // independent of per-doc tab title set; addSheetTab handles uniqueness
+      );
+      comparativeQuarters = compResult.quartersIncluded;
+      comparativeTabsCreated = compResult.tabsCreated;
+    }
+
     // Make the sheet shareable
     const permissionResponse = await fetch(
       `https://www.googleapis.com/drive/v3/files/${spreadsheetId}/permissions`,
@@ -1457,13 +1723,17 @@ export async function POST(request: NextRequest) {
       tabsCreated > 0
         ? ` with ${tabsCreated} extracted-table tab${tabsCreated !== 1 ? "s" : ""}`
         : "";
+    const comparativeSuffix =
+      comparativeTabsCreated > 0
+        ? ` plus an XBRL comparative tab covering ${comparativeQuarters} quarter${comparativeQuarters !== 1 ? "s" : ""}`
+        : "";
 
     return NextResponse.json(
       {
         success: true,
         spreadsheetId,
         sheetUrl,
-        message: `Successfully exported ${appendResult.rowsWritten} ${rowNoun}${appendResult.rowsWritten !== 1 ? "s" : ""} to Google Sheets${docCreatedSuffix}${tabsSuffix}`,
+        message: `Successfully exported ${appendResult.rowsWritten} ${rowNoun}${appendResult.rowsWritten !== 1 ? "s" : ""} to Google Sheets${docCreatedSuffix}${tabsSuffix}${comparativeSuffix}`,
       },
       { status: 200 }
     );

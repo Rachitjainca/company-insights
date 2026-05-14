@@ -65,6 +65,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
   const [showSuccess, setShowSuccess] = useState(false);
   const [xbrlMode, setXbrlMode] = useState(false);
   const [includeContent, setIncludeContent] = useState(true);
+  const [includeXbrlComparative, setIncludeXbrlComparative] = useState(true);
 
   // Whether any selected doc has an XBRL URL and is a quarterly result
   const hasXbrlDocs = selectedDocs.some(
@@ -96,6 +97,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
         exportMode: effectiveXbrlMode ? "xbrl" : "metadata",
         createGoogleDocs: true,
         includeContent: effectiveXbrlMode ? false : includeContent,
+        includeXbrlComparative: hasXbrlDocs && includeXbrlComparative,
       });
       if (result.success) {
         setSheetUrl(result.sheetUrl ?? "");
@@ -145,6 +147,14 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
               description="Parse Reg 33 Ind-AS XBRL files — writes Revenue, PAT, EPS and other metrics as columns instead of document links."
             />
           )}
+          {hasXbrlDocs && (
+            <ToggleCard
+              checked={includeXbrlComparative}
+              onChange={setIncludeXbrlComparative}
+              label="Add XBRL comparative repository tab"
+              description="Pivots all selected quarters side-by-side as a data repository — metrics as rows, quarters as columns, plus an automatic QoQ % change block. Ideal for trend analysis."
+            />
+          )}
           {!effectiveXbrlMode && (
             <ToggleCard
               checked={includeContent}
@@ -156,7 +166,7 @@ export default function ExportButton({ company, selectedDocs }: ExportButtonProp
           {!effectiveXbrlMode && (
             <div className="px-3.5 py-3 rounded-xl border border-slate-200 bg-slate-50 text-xs text-slate-600 leading-relaxed">
               {includeContent
-                ? "Each row in the sheet will include the source URL, a generated Google Doc URL, and the extracted financial / KPI text. Best for offline review and downstream analysis."
+                ? "Each row in the sheet will include the source URL, a generated Google Doc URL, and the extracted financial / KPI text. PDF tables are also extracted into dedicated tabs with one cell per value."
                 : "Each row in the sheet will include the source URL and a generated Google Doc URL. The Doc is populated with extracted financial and KPI tables when available — ideal for lighter exports."}
             </div>
           )}
