@@ -30,6 +30,7 @@ interface BSEFilingsResponse {
 
 const BSE_CDN = "https://www.bseindia.com";
 const BSE_FETCH_RETRIES = 3;
+const BSE_FILINGS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 const BSE_HEADERS: HeadersInit = {
   "User-Agent":
@@ -114,6 +115,28 @@ const CATEGORY_PATTERNS: Array<{ category: IRCategory; patterns: RegExp[] }> = [
     ],
   },
 ];
+
+interface BSEDocsCacheEntry {
+  at: number;
+  docs: IRDocument[];
+}
+
+const bseFilingsCache = new Map<string, BSEDocsCacheEntry>();
+const bseFilingsInFlight = new Map<string, Promise<IRDocument[]>>();
+
+function cloneDocs(docs: IRDocument[]): IRDocument[] {
+  return docs.map((d) => ({ ...d }));
+}
+
+function getCachedBSEDocs(code: string): IRDocument[] | null {
+  const hit = bseFilingsCache.get(code);
+  if (!hit) return null;
+  if (Date.now() - hit.at > BSE_FILINGS_CACHE_TTL_MS) {
+    bseFilingsCache.delete(code);
+    return null;
+  }
+  return cloneDocs(hit.docs);
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -255,11 +278,19 @@ export async function lookupBSECode(nseSymbol: string): Promise<string | null> {
  * captured (each page returns ~25-50 rows).
  */
 export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
+  const code = bseCode.trim();
+  const cached = getCachedBSEDocs(code);
+  if (cached) return cached;
+
+  const pending = bseFilingsInFlight.get(code);
+  if (pending) return cloneDocs(await pending);
+
+  const run = (async (): Promise<IRDocument[]> => {
   try {
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
     const buildUrl = (pageno: number, search: "P" | "") =>
       `https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w` +
-      `?pageno=${pageno}&strCat=-1&strPrevDate=20200101&strScrip=${encodeURIComponent(bseCode)}` +
+      `?pageno=${pageno}&strCat=-1&strPrevDate=20200101&strScrip=${encodeURIComponent(code)}` +
       `&strToDate=${today}&strType=C&strSearch=${search}`;
 
     const MAX_PAGES = 5;
@@ -315,8 +346,17 @@ export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
       });
     }
 
+    bseFilingsCache.set(code, { at: Date.now(), docs: cloneDocs(docs) });
     return docs;
   } catch {
     return [];
+  }
+  })();
+
+  bseFilingsInFlight.set(code, run);
+  try {
+    return cloneDocs(await run);
+  } finally {
+    bseFilingsInFlight.delete(code);
   }
 }

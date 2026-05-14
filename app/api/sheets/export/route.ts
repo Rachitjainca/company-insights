@@ -28,6 +28,7 @@ const MAX_SOURCE_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_DOC_TEXT_CHARS = 800000;
 const MAX_SHEET_CONTENT_CHARS = 20000;
 const SOURCE_CONVERSION_TIMEOUT_MS = 120000;
+const DEFAULT_EXPORT_PREP_CONCURRENCY = 5;
 
 interface ExportDocument {
   category: string;
@@ -1399,7 +1400,10 @@ async function appendDocumentRows(
     // extraction + Drive multipart upload + Doc creation) are independent
     // and can run concurrently. Sheet writes still happen serially below to
     // preserve row order and keep tab-create batchUpdates conflict-free.
-    const PREP_CONCURRENCY = 4;
+    const envConcurrency = Number(process.env.EXPORT_PREP_CONCURRENCY || "");
+    const PREP_CONCURRENCY = Number.isFinite(envConcurrency) && envConcurrency > 0
+      ? Math.min(8, Math.max(1, Math.floor(envConcurrency)))
+      : DEFAULT_EXPORT_PREP_CONCURRENCY;
 
     interface PrepResult {
       doc: ExportDocument;

@@ -461,9 +461,12 @@ function mapIntegratedRowsToQuarterlyDocs(
  * `xbrlUrl` always carries the XBRL XML link when available.
  */
 export async function fetchNSEQuarterlyResults(symbol: string): Promise<IRDocument[]> {
-  const integratedDocs = await fetchNSEQuarterlyResultsIntegrated(symbol);
-  if (integratedDocs.length > 0) return integratedDocs;
-  return fetchNSEQuarterlyResultsLegacy(symbol);
+  const key = symbol.toUpperCase().trim();
+  return withDocCache(key, nseQuarterlyCache, nseQuarterlyInFlight, async () => {
+    const integratedDocs = await fetchNSEQuarterlyResultsIntegrated(symbol);
+    if (integratedDocs.length > 0) return integratedDocs;
+    return fetchNSEQuarterlyResultsLegacy(symbol);
+  });
 }
 
 export async function probeNSEIntegratedQuarterlyHealth(
@@ -632,71 +635,74 @@ async function fetchNSEQuarterlyResultsLegacy(symbol: string): Promise<IRDocumen
  * Returns IRDocument[] ordered newest-first with xbrlUrl populated where matched.
  */
 export async function fetchNSEAnnualReports(symbol: string): Promise<IRDocument[]> {
-  try {
-    const base = `https://www.nseindia.com/api`;
-    const sym = encodeURIComponent(symbol);
-    const cookie = await getNSECookie();
-    const headers = { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) };
+  const key = symbol.toUpperCase().trim();
+  return withDocCache(key, nseAnnualCache, nseAnnualInFlight, async () => {
+    try {
+      const base = `https://www.nseindia.com/api`;
+      const sym = encodeURIComponent(symbol);
+      const cookie = await getNSECookie();
+      const headers = { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) };
 
-    const [annualRes, xbrlRes] = await Promise.allSettled([
-      fetch(`${base}/annual-reports?index=equities&symbol=${sym}`, {
-        headers,
-        next: { revalidate: 86400 },
-      }),
-      fetch(`${base}/annual-reports-xbrl?index=equities&symbol=${sym}`, {
-        headers,
-        next: { revalidate: 86400 },
-      }),
-    ]);
+      const [annualRes, xbrlRes] = await Promise.allSettled([
+        fetch(`${base}/annual-reports?index=equities&symbol=${sym}`, {
+          headers,
+          next: { revalidate: 86400 },
+        }),
+        fetch(`${base}/annual-reports-xbrl?index=equities&symbol=${sym}`, {
+          headers,
+          next: { revalidate: 86400 },
+        }),
+      ]);
 
-    // Parse annual reports — validate JSON body before parsing
-    const annualData: NSEAnnualReport[] = [];
-    if (annualRes.status === "fulfilled" && annualRes.value.ok) {
-      const text = await annualRes.value.text();
-      if (text.trimStart().startsWith("{") || text.trimStart().startsWith("[")) {
-        const json = JSON.parse(text);
-        if (Array.isArray(json?.data)) annualData.push(...json.data);
+      // Parse annual reports — validate JSON body before parsing
+      const annualData: NSEAnnualReport[] = [];
+      if (annualRes.status === "fulfilled" && annualRes.value.ok) {
+        const text = await annualRes.value.text();
+        if (text.trimStart().startsWith("{") || text.trimStart().startsWith("[")) {
+          const json = JSON.parse(text);
+          if (Array.isArray(json?.data)) annualData.push(...json.data);
+        }
       }
-    }
 
-    // Parse XBRL annual reports — build a lookup keyed by "toYr|submission_type"
-    const xbrlByKey = new Map<string, string>();
-    if (xbrlRes.status === "fulfilled" && xbrlRes.value.ok) {
-      const text = await xbrlRes.value.text();
-      if (text.trimStart().startsWith("{") || text.trimStart().startsWith("[")) {
-        const json = JSON.parse(text);
-        if (Array.isArray(json?.data)) {
-          for (const row of json.data as NSEAnnualReportXBRL[]) {
-            if (row.fileName && row.fileName.endsWith(".xml")) {
-              const key = `${row.toYr}|${row.submission_type}`;
-              if (!xbrlByKey.has(key)) xbrlByKey.set(key, row.fileName);
+      // Parse XBRL annual reports — build a lookup keyed by "toYr|submission_type"
+      const xbrlByKey = new Map<string, string>();
+      if (xbrlRes.status === "fulfilled" && xbrlRes.value.ok) {
+        const text = await xbrlRes.value.text();
+        if (text.trimStart().startsWith("{") || text.trimStart().startsWith("[")) {
+          const json = JSON.parse(text);
+          if (Array.isArray(json?.data)) {
+            for (const row of json.data as NSEAnnualReportXBRL[]) {
+              if (row.fileName && row.fileName.endsWith(".xml")) {
+                const xbrlKey = `${row.toYr}|${row.submission_type}`;
+                if (!xbrlByKey.has(xbrlKey)) xbrlByKey.set(xbrlKey, row.fileName);
+              }
             }
           }
         }
       }
+
+      // Map annual reports → IRDocument[]
+      const docs: IRDocument[] = annualData.map((row) => {
+        const fiscalYear = `FY${row.toYr}`;
+        const reportKey = `${row.toYr}|${row.submission_type}`;
+        const xbrlUrl = xbrlByKey.get(reportKey);
+
+        return {
+          category: "annual-report" as IRCategory,
+          fiscalYear,
+          title: `Annual Report ${fiscalYear} (${row.submission_type})`,
+          url: row.fileName,
+          type: detectType(row.fileName),
+          xbrlUrl,
+          source: "nse" as const,
+        };
+      });
+
+      return docs;
+    } catch {
+      return [];
     }
-
-    // Map annual reports → IRDocument[]
-    const docs: IRDocument[] = annualData.map((row) => {
-      const fiscalYear = `FY${row.toYr}`;
-      const key = `${row.toYr}|${row.submission_type}`;
-      const xbrlUrl = xbrlByKey.get(key);
-
-      return {
-        category: "annual-report" as IRCategory,
-        fiscalYear,
-        title: `Annual Report ${fiscalYear} (${row.submission_type})`,
-        url: row.fileName,
-        type: detectType(row.fileName),
-        xbrlUrl,
-        source: "nse" as const,
-      };
-    });
-
-    return docs;
-  } catch {
-    return [];
-  }
+  });
 }
 
 // ─── NSE Corporate Announcements ─────────────────────────────────────────────
@@ -719,6 +725,60 @@ export interface NSEAnnouncement {
 }
 
 const ANNOUNCEMENT_LIMIT = 300;
+
+interface DocCacheEntry {
+  at: number;
+  docs: IRDocument[];
+}
+
+const NSE_DOC_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const nseQuarterlyCache = new Map<string, DocCacheEntry>();
+const nseAnnualCache = new Map<string, DocCacheEntry>();
+const nseAnnouncementCache = new Map<string, DocCacheEntry>();
+
+const nseQuarterlyInFlight = new Map<string, Promise<IRDocument[]>>();
+const nseAnnualInFlight = new Map<string, Promise<IRDocument[]>>();
+const nseAnnouncementInFlight = new Map<string, Promise<IRDocument[]>>();
+
+function cloneDocs(docs: IRDocument[]): IRDocument[] {
+  return docs.map((d) => ({ ...d }));
+}
+
+function getCachedDocs(cache: Map<string, DocCacheEntry>, key: string): IRDocument[] | null {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > NSE_DOC_CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return cloneDocs(hit.docs);
+}
+
+async function withDocCache(
+  key: string,
+  cache: Map<string, DocCacheEntry>,
+  inFlight: Map<string, Promise<IRDocument[]>>,
+  loader: () => Promise<IRDocument[]>
+): Promise<IRDocument[]> {
+  const cached = getCachedDocs(cache, key);
+  if (cached) return cached;
+
+  const pending = inFlight.get(key);
+  if (pending) return cloneDocs(await pending);
+
+  const run = (async () => {
+    const docs = await loader();
+    cache.set(key, { at: Date.now(), docs: cloneDocs(docs) });
+    return docs;
+  })();
+
+  inFlight.set(key, run);
+  try {
+    return cloneDocs(await run);
+  } finally {
+    inFlight.delete(key);
+  }
+}
 
 // Keyword patterns for announcement subject classification
 const NSE_PRES_RE = /investor\s+presentation|analyst\s+(meet|day|briefing)|earnings\s+presentation|roadshow|business\s+update|earnings\s+update|\bpresentation\b/i;
@@ -771,31 +831,34 @@ export function mapNSEAnnouncementsToIRDocs(
  * announcements.  Covers the last 3 years of filings.
  */
 export async function fetchNSEAnnouncements(symbol: string): Promise<IRDocument[]> {
-  try {
-    const cookie = await getNSECookie();
-    const headers = { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) };
+  const key = symbol.toUpperCase().trim();
+  return withDocCache(key, nseAnnouncementCache, nseAnnouncementInFlight, async () => {
+    try {
+      const cookie = await getNSECookie();
+      const headers = { ...NSE_HEADERS, ...(cookie ? { Cookie: cookie } : {}) };
 
-    // Build a 5-year date range; NSE expects DD-MM-YYYY
-    const now = new Date();
-    const toDate = `${String(now.getDate()).padStart(2, "0")}-${String(now.getMonth() + 1).padStart(2, "0")}-${now.getFullYear()}`;
-    const fromDate = `01-01-${now.getFullYear() - 5}`;
+      // Build a 5-year date range; NSE expects DD-MM-YYYY
+      const now = new Date();
+      const toDate = `${String(now.getDate()).padStart(2, "0")}-${String(now.getMonth() + 1).padStart(2, "0")}-${now.getFullYear()}`;
+      const fromDate = `01-01-${now.getFullYear() - 5}`;
 
-    const url =
-      `https://www.nseindia.com/api/corporate-announcements` +
-      `?index=equities&symbol=${encodeURIComponent(symbol)}` +
-      `&from_date=${encodeURIComponent(fromDate)}&to_date=${encodeURIComponent(toDate)}`;
+      const url =
+        `https://www.nseindia.com/api/corporate-announcements` +
+        `?index=equities&symbol=${encodeURIComponent(symbol)}` +
+        `&from_date=${encodeURIComponent(fromDate)}&to_date=${encodeURIComponent(toDate)}`;
 
-    const res = await fetch(url, { headers, next: { revalidate: 3600 } });
-    if (!res.ok) return [];
+      const res = await fetch(url, { headers, next: { revalidate: 3600 } });
+      if (!res.ok) return [];
 
-    const text = await res.text();
-    if (!text.trimStart().startsWith("[") && !text.trimStart().startsWith("{")) return [];
+      const text = await res.text();
+      if (!text.trimStart().startsWith("[") && !text.trimStart().startsWith("{")) return [];
 
-    const data: NSEAnnouncement[] = JSON.parse(text);
-    if (!Array.isArray(data)) return [];
+      const data: NSEAnnouncement[] = JSON.parse(text);
+      if (!Array.isArray(data)) return [];
 
-    return mapNSEAnnouncementsToIRDocs(data);
-  } catch {
-    return [];
-  }
+      return mapNSEAnnouncementsToIRDocs(data);
+    } catch {
+      return [];
+    }
+  });
 }

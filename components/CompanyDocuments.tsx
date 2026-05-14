@@ -336,8 +336,11 @@ export default function CompanyDocuments({
 
   const fetchDocs = useCallback(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
-    fetch(`/api/companies/${encodeURIComponent(ticker)}/ir-docs`, { cache: "no-store" })
+    fetch(`/api/companies/${encodeURIComponent(ticker)}/ir-docs`, {
+      signal: controller.signal,
+    })
       .then(async (res) => {
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`);
@@ -351,7 +354,10 @@ export default function CompanyDocuments({
         });
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [ticker]);
 
   const load = useCallback(() => {

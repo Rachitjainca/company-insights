@@ -19,6 +19,47 @@ import type { CompanyDocumentsBundle } from "@/lib/scrapers/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const IR_DOCS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+interface IRDocsPayload {
+  ticker: string;
+  companyName: string;
+  bseCode: string | null;
+  documents: Record<IRCategory, IRDocument[]>;
+  totalCount: number;
+  fetchedAt: string;
+  sources: {
+    scraper: boolean;
+    nseQuarterly: boolean;
+    nseAnnual: boolean;
+    nseAnnouncements: boolean;
+    bseCode: string | null;
+    bseFilings: boolean;
+  };
+}
+
+interface IRDocsCacheEntry {
+  at: number;
+  payload: IRDocsPayload;
+}
+
+const irDocsCache = new Map<string, IRDocsCacheEntry>();
+const irDocsInFlight = new Map<string, Promise<IRDocsPayload>>();
+
+function clonePayload(payload: IRDocsPayload): IRDocsPayload {
+  return {
+    ...payload,
+    documents: {
+      "quarterly-results": payload.documents["quarterly-results"].map((d) => ({ ...d })),
+      "investor-presentation": payload.documents["investor-presentation"].map((d) => ({ ...d })),
+      concall: payload.documents.concall.map((d) => ({ ...d })),
+      "annual-report": payload.documents["annual-report"].map((d) => ({ ...d })),
+      "kpi-handbook": payload.documents["kpi-handbook"].map((d) => ({ ...d })),
+    },
+    sources: { ...payload.sources },
+  };
+}
+
 // ─── Mapping from scraper categoryKey → IRCategory ────────────────────────────
 
 const SCRAPER_KEY_MAP: Record<string, IRCategory> = {
@@ -146,98 +187,122 @@ export async function GET(
   const { ticker } = await params;
   const upperTicker = ticker.toUpperCase();
 
-  // Run all data sources in parallel
-  const [scraperResult, nseQuarterlyResult, nseAnnualResult, nseAnnouncementsResult, bseCode] =
-    await Promise.allSettled([
-      (async () => {
-        const scraper = getScraper(upperTicker);
-        if (!scraper) return null;
-        return scraper.fetchDocuments();
-      })(),
-      fetchNSEQuarterlyResults(upperTicker),
-      fetchNSEAnnualReports(upperTicker),
-      fetchNSEAnnouncements(upperTicker),
-      lookupBSECode(upperTicker),
-    ]);
-
-  const docs: IRDocument[] = [];
-  let companyName = upperTicker;
-  let bseDocsFetchedCount = 0;
-
-  // 1. Custom scraper results (highest priority — company-specific)
-  if (scraperResult.status === "fulfilled" && scraperResult.value) {
-    const bundle = scraperResult.value;
-    companyName = bundle.companyName || companyName;
-    docs.push(...bundleToIRDocs(bundle));
+  const forceRefresh = request.nextUrl.searchParams.get("refresh") === "1";
+  if (!forceRefresh) {
+    const hit = irDocsCache.get(upperTicker);
+    if (hit && Date.now() - hit.at <= IR_DOCS_CACHE_TTL_MS) {
+      return NextResponse.json(clonePayload(hit.payload), {
+        headers: {
+          "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
+          "X-IR-Cache": "HIT",
+        },
+      });
+    }
   }
 
-  // 2. NSE quarterly results (authoritative for quarterly-results category)
-  if (nseQuarterlyResult.status === "fulfilled") {
-    docs.push(...nseQuarterlyResult.value);
+  const existing = irDocsInFlight.get(upperTicker);
+  if (existing) {
+    const payload = clonePayload(await existing);
+    return NextResponse.json(payload, {
+      headers: {
+        "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
+        "X-IR-Cache": "INFLIGHT",
+      },
+    });
   }
 
-  // 3. NSE annual reports (authoritative for annual-report category)
-  if (nseAnnualResult.status === "fulfilled") {
-    docs.push(...nseAnnualResult.value);
-  }
+  const load = (async (): Promise<IRDocsPayload> => {
+    // Run all data sources in parallel
+    const [scraperResult, nseQuarterlyResult, nseAnnualResult, nseAnnouncementsResult, bseCode] =
+      await Promise.allSettled([
+        (async () => {
+          const scraper = getScraper(upperTicker);
+          if (!scraper) return null;
+          return scraper.fetchDocuments();
+        })(),
+        fetchNSEQuarterlyResults(upperTicker),
+        fetchNSEAnnualReports(upperTicker),
+        fetchNSEAnnouncements(upperTicker),
+        lookupBSECode(upperTicker),
+      ]);
 
-  // 4. NSE corporate announcements — investor presentations and concalls from NSE
-  if (nseAnnouncementsResult.status === "fulfilled") {
-    docs.push(...nseAnnouncementsResult.value);
-  }
+    const docs: IRDocument[] = [];
+    let companyName = upperTicker;
+    let bseDocsFetchedCount = 0;
 
-  // 5. BSE filings — investor presentations, concalls, KPIs always added.
-  //    For quarterly-results and annual-report we keep BSE rows alongside
-  //    NSE rows: BSE attachments are the actual PDFs that issuers upload, and
-  //    NSE often only provides the iXBRL HTML / XML link. Dedup downstream
-  //    handles exact URL collisions.
-  const bseCodeValue = bseCode.status === "fulfilled" ? bseCode.value : null;
-  if (bseCodeValue) {
-    const bseDocs = await fetchBSEFilings(bseCodeValue);
-    bseDocsFetchedCount = bseDocs.length;
-    docs.push(...bseDocs);
-  }
+    // 1. Custom scraper results (highest priority — company-specific)
+    if (scraperResult.status === "fulfilled" && scraperResult.value) {
+      const bundle = scraperResult.value;
+      companyName = bundle.companyName || companyName;
+      docs.push(...bundleToIRDocs(bundle));
+    }
 
-  const appOrigin = getCanonicalAppOrigin(request.url);
+    // 2. NSE quarterly results (authoritative for quarterly-results category)
+    if (nseQuarterlyResult.status === "fulfilled") {
+      docs.push(...nseQuarterlyResult.value);
+    }
 
-  // Ensure API output always carries valid absolute URLs.
-  const normalizedDocs = docs
-    .map((doc) => {
-      const normalizedUrl = normalizeDocUrl(doc.url, appOrigin);
-      if (!normalizedUrl) return null;
-      return { ...doc, url: normalizedUrl };
-    })
-    .filter((d): d is IRDocument => d !== null);
+    // 3. NSE annual reports (authoritative for annual-report category)
+    if (nseAnnualResult.status === "fulfilled") {
+      docs.push(...nseAnnualResult.value);
+    }
 
-  const dedupedDocs = dedup(normalizedDocs);
+    // 4. NSE corporate announcements — investor presentations and concalls from NSE
+    if (nseAnnouncementsResult.status === "fulfilled") {
+      docs.push(...nseAnnouncementsResult.value);
+    }
 
-  // Group by category for the response (makes UI rendering easier)
-  const grouped: Record<IRCategory, IRDocument[]> = {
-    "quarterly-results": [],
-    "investor-presentation": [],
-    "concall": [],
-    "annual-report": [],
-    "kpi-handbook": [],
-  };
-  for (const doc of dedupedDocs) {
-    grouped[doc.category].push(doc);
-  }
+    // 5. BSE filings — investor presentations, concalls, KPIs always added.
+    //    For quarterly-results and annual-report we keep BSE rows alongside
+    //    NSE rows: BSE attachments are the actual PDFs that issuers upload, and
+    //    NSE often only provides the iXBRL HTML / XML link. Dedup downstream
+    //    handles exact URL collisions.
+    const bseCodeValue = bseCode.status === "fulfilled" ? bseCode.value : null;
+    if (bseCodeValue) {
+      const bseDocs = await fetchBSEFilings(bseCodeValue);
+      bseDocsFetchedCount = bseDocs.length;
+      docs.push(...bseDocs);
+    }
 
-  // Diagnostic: report which sources returned data so the UI can show warnings
-  const sources = {
-    scraper: scraperResult.status === "fulfilled" && scraperResult.value !== null,
-    nseQuarterly:
-      nseQuarterlyResult.status === "fulfilled" && nseQuarterlyResult.value.length > 0,
-    nseAnnual:
-      nseAnnualResult.status === "fulfilled" && nseAnnualResult.value.length > 0,
-    nseAnnouncements:
-      nseAnnouncementsResult.status === "fulfilled" && nseAnnouncementsResult.value.length > 0,
-    bseCode: bseCodeValue ?? null,
-    bseFilings: bseDocsFetchedCount > 0,
-  };
+    const appOrigin = getCanonicalAppOrigin(request.url);
 
-  return NextResponse.json(
-    {
+    // Ensure API output always carries valid absolute URLs.
+    const normalizedDocs = docs
+      .map((doc) => {
+        const normalizedUrl = normalizeDocUrl(doc.url, appOrigin);
+        if (!normalizedUrl) return null;
+        return { ...doc, url: normalizedUrl };
+      })
+      .filter((d): d is IRDocument => d !== null);
+
+    const dedupedDocs = dedup(normalizedDocs);
+
+    // Group by category for the response (makes UI rendering easier)
+    const grouped: Record<IRCategory, IRDocument[]> = {
+      "quarterly-results": [],
+      "investor-presentation": [],
+      concall: [],
+      "annual-report": [],
+      "kpi-handbook": [],
+    };
+    for (const doc of dedupedDocs) {
+      grouped[doc.category].push(doc);
+    }
+
+    // Diagnostic: report which sources returned data so the UI can show warnings
+    const sources = {
+      scraper: scraperResult.status === "fulfilled" && scraperResult.value !== null,
+      nseQuarterly:
+        nseQuarterlyResult.status === "fulfilled" && nseQuarterlyResult.value.length > 0,
+      nseAnnual:
+        nseAnnualResult.status === "fulfilled" && nseAnnualResult.value.length > 0,
+      nseAnnouncements:
+        nseAnnouncementsResult.status === "fulfilled" && nseAnnouncementsResult.value.length > 0,
+      bseCode: bseCodeValue ?? null,
+      bseFilings: bseDocsFetchedCount > 0,
+    };
+
+    return {
       ticker: upperTicker,
       companyName,
       bseCode: bseCodeValue ?? null,
@@ -245,11 +310,20 @@ export async function GET(
       totalCount: dedupedDocs.length,
       fetchedAt: new Date().toISOString(),
       sources,
-    },
-    {
+    };
+  })();
+
+  irDocsInFlight.set(upperTicker, load);
+  try {
+    const payload = await load;
+    irDocsCache.set(upperTicker, { at: Date.now(), payload: clonePayload(payload) });
+    return NextResponse.json(payload, {
       headers: {
         "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
+        "X-IR-Cache": "MISS",
       },
-    }
-  );
+    });
+  } finally {
+    irDocsInFlight.delete(upperTicker);
+  }
 }
