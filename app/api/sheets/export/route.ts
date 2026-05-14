@@ -80,6 +80,14 @@ interface SourceTextResult {
   convertedFileId?: string;
 }
 
+interface ConcallInsightRow {
+  topic: string;
+  insight: string;
+  confidence: "High" | "Medium" | "Low";
+  sourceSentence: string;
+  score: number;
+}
+
 /**
  * Refresh the access token using refresh token
  */
@@ -597,12 +605,16 @@ async function writeTablesAsSheetTabs(
   doc: ExportDocument,
   tables: ExtractedTable[],
   usedTabTitles: Set<string>,
-  extractedText: string = ""
+  extractedText: string = "",
+  concallInsightRows: ConcallInsightRow[] = []
 ): Promise<{ tabsCreated: number; tabTitles: string[]; sheetIds: number[] }> {
   const created: string[] = [];
   const createdSheetIds: number[] = [];
   const hasText = extractedText.trim().length > 0;
-  if (tables.length === 0 && !hasText) return { tabsCreated: 0, tabTitles: [], sheetIds: [] };
+  const hasConcallInsights = concallInsightRows.length > 0;
+  if (tables.length === 0 && !hasText && !hasConcallInsights) {
+    return { tabsCreated: 0, tabTitles: [], sheetIds: [] };
+  }
 
   // Build a base tab title from doc context.
   const periodPart = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" ");
@@ -634,6 +646,7 @@ async function writeTablesAsSheetTabs(
   if (periodPart) values.push([`Period: ${periodPart}`]);
   values.push([
     `Extracted: ${tables.length} financial table${tables.length !== 1 ? "s" : ""}` +
+      (hasConcallInsights ? ` · ${concallInsightRows.length} concall insight points` : "") +
       (hasText ? ` · ${extractedText.length.toLocaleString()} chars of text` : ""),
   ]);
   values.push([]);
@@ -641,6 +654,19 @@ async function writeTablesAsSheetTabs(
   // Track which row is the first detected table's header (to bold + freeze).
   let headerRowIndex = -1;
   let headerColCount = 0;
+
+  if (hasConcallInsights) {
+    values.push(["── Concall Contextual Insights ──"]);
+    values.push(["Topic", "Insight", "Confidence", "Source Sentence"]);
+    if (headerRowIndex < 0) {
+      headerRowIndex = values.length - 1;
+      headerColCount = 4;
+    }
+    for (const row of concallInsightRows) {
+      values.push([row.topic, row.insight, row.confidence, row.sourceSentence]);
+    }
+    values.push([]);
+  }
 
   tables.forEach((t, i) => {
     values.push([`${i + 1}. ${t.caption}`]);
@@ -725,6 +751,134 @@ const CATEGORY_LABELS: Record<string, string> = {
 
 const FINANCIAL_KPI_RE =
   /revenue|income|expense|ebitda|ebit|pbt|pat|profit|loss|eps|margin|cash\s*flow|asset|liabilit|debt|borrow|capex|kpi|key\s*performance|operat(?:ing|ional)|volume|utili[sz]ation|subscriber|arpu|aov|order|guidance|roe|roa|roce|gnpa|nnpa|aum/i;
+
+const CONCALL_TOPIC_PATTERNS: Array<{ topic: string; re: RegExp }> = [
+  {
+    topic: "Guidance / Outlook",
+    re: /guidance|outlook|visibility|expect|expectation|forecast|pipeline|run\s*rate/i,
+  },
+  {
+    topic: "Demand / Growth Drivers",
+    re: /demand|growth|volume|order|book|inflow|pricing|realisation|utili[sz]ation|traction/i,
+  },
+  {
+    topic: "Margins / Profitability",
+    re: /margin|ebitda|profit|pat|pbt|cost|opex|operating\s+leverage/i,
+  },
+  {
+    topic: "Capital Allocation",
+    re: /capex|debt|cash\s*flow|working\s+capital|dividend|buyback|leverage/i,
+  },
+  {
+    topic: "Risks / Headwinds",
+    re: /risk|headwind|challenge|pressure|inflation|slowdown|uncertain|volatil/i,
+  },
+];
+
+function splitSentencesForInsights(text: string): string[] {
+  const normalized = normalizeWhitespace(text)
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return [];
+
+  // Conservative sentence split keeps abbreviations mostly intact and avoids
+  // over-fragmenting raw transcript blocks.
+  return normalized
+    .split(/(?<=[.!?])\s+(?=[A-Z0-9])/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 45 && s.length <= 320)
+    .filter((s) => !/^(thank\s+you|operator|question\s+and\s+answer|disclaimer)/i.test(s));
+}
+
+function scoreInsightSentence(sentence: string): number {
+  let score = 0;
+  if (/\d/.test(sentence)) score += 2;
+  if (/%|\b(qoq|yoy|fy|q[1-4])\b/i.test(sentence)) score += 2;
+  if (/\b(will|expect|target|plan|focus|continue|improve|maintain)\b/i.test(sentence)) {
+    score += 2;
+  }
+  if (FINANCIAL_KPI_RE.test(sentence)) score += 2;
+
+  const words = sentence.split(/\s+/).length;
+  if (words >= 14 && words <= 38) score += 2;
+  return score;
+}
+
+function confidenceFromInsightScore(score: number): "High" | "Medium" | "Low" {
+  if (score >= 8) return "High";
+  if (score >= 6) return "Medium";
+  return "Low";
+}
+
+function inferInsightTopic(sentence: string): string {
+  for (const topic of CONCALL_TOPIC_PATTERNS) {
+    if (topic.re.test(sentence)) return topic.topic;
+  }
+  return "General Context";
+}
+
+function summarizeSentence(sentence: string): string {
+  const normalized = sentence.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 220) return normalized;
+  return `${normalized.slice(0, 217).trimEnd()}...`;
+}
+
+function buildConcallInsightRows(rawText: string, maxPoints = 6): ConcallInsightRow[] {
+  const sentences = splitSentencesForInsights(rawText);
+  if (sentences.length === 0) return [];
+
+  const used = new Set<string>();
+  const rows: ConcallInsightRow[] = [];
+
+  // First pass: strongest sentence for each known topic.
+  for (const topic of CONCALL_TOPIC_PATTERNS) {
+    const candidates = sentences
+      .filter((s) => topic.re.test(s))
+      .map((s) => ({ s, score: scoreInsightSentence(s) }))
+      .sort((a, b) => b.score - a.score);
+
+    const best = candidates.find((c) => !used.has(c.s));
+    if (!best) continue;
+
+    used.add(best.s);
+    rows.push({
+      topic: topic.topic,
+      insight: summarizeSentence(best.s),
+      confidence: confidenceFromInsightScore(best.score),
+      sourceSentence: best.s,
+      score: best.score,
+    });
+    if (rows.length >= maxPoints) break;
+  }
+
+  // Second pass: highest-scoring leftovers for contextual completeness.
+  if (rows.length < maxPoints) {
+    const fallback = sentences
+      .filter((s) => !used.has(s))
+      .map((s) => ({ s, score: scoreInsightSentence(s) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxPoints - rows.length);
+
+    for (const item of fallback) {
+      rows.push({
+        topic: inferInsightTopic(item.s),
+        insight: summarizeSentence(item.s),
+        confidence: confidenceFromInsightScore(item.score),
+        sourceSentence: item.s,
+        score: item.score,
+      });
+    }
+  }
+
+  return rows;
+}
+
+function formatConcallInsights(rows: ConcallInsightRow[]): string {
+  if (rows.length === 0) return "";
+  return rows.map((r) => `- ${r.topic}: ${r.insight}`).join("\n");
+}
 
 function isTableLikeLine(line: string): boolean {
   const numericTokens = line.match(/-?\d[\d,]*(?:\.\d+)?%?/g) ?? [];
@@ -1245,6 +1399,8 @@ async function buildGoogleDocContentForDocument(
   docText: string;
   status: string;
   tables: ExtractedTable[];
+  concallInsights?: string;
+  concallInsightRows?: ConcallInsightRow[];
   convertedFileId?: string;
 }> {
   // 1) Taxonomy-based extraction for quarterly result docs with XBRL.
@@ -1295,6 +1451,30 @@ async function buildGoogleDocContentForDocument(
 
   // 3) Direct text-only fetch (HTML/XML/plain text resources).
   const extracted = await extractDocumentContent(doc.url);
+  if (doc.category === "concall" && extracted.fullText) {
+    const insightRows = buildConcallInsightRows(extracted.fullText);
+    if (insightRows.length > 0) {
+      const insights = formatConcallInsights(insightRows);
+      return {
+        docText: toDocText(
+          [
+            buildDocHeader(data, doc),
+            "",
+            "Concall Contextual Key Insights",
+            insights,
+            "",
+            "Concall Summary Excerpt",
+            toSheetContent(extracted.fullText),
+          ].join("\n")
+        ),
+        status: `ok-concall-summary-${extracted.status}`,
+        tables: [],
+        concallInsights: insights,
+        concallInsightRows: insightRows,
+      };
+    }
+  }
+
   if (extracted.fullText) {
     const filtered = extractFinancialKpiText(extracted.fullText);
     if (filtered) {
@@ -1325,6 +1505,31 @@ async function buildGoogleDocContentForDocument(
     `${data.company.symbol} - ${doc.title}`.slice(0, 120),
     doc.url
   );
+  if (doc.category === "concall" && converted.extractedText) {
+    const insightRows = buildConcallInsightRows(converted.extractedText);
+    if (insightRows.length > 0) {
+      const insights = formatConcallInsights(insightRows);
+      return {
+        docText: toDocText(
+          [
+            buildDocHeader(data, doc),
+            "",
+            "Concall Contextual Key Insights",
+            insights,
+            "",
+            "Concall Summary Excerpt",
+            toSheetContent(converted.extractedText),
+          ].join("\n")
+        ),
+        status: `ok-concall-summary-${converted.status}`,
+        tables: converted.tables,
+        concallInsights: insights,
+        concallInsightRows: insightRows,
+        convertedFileId: converted.convertedFileId,
+      };
+    }
+  }
+
   if (converted.extractedText) {
     const filtered = extractFinancialKpiText(converted.extractedText);
     if (filtered) {
@@ -1386,6 +1591,7 @@ async function appendDocumentRows(
       "Google Doc URL",
       "Doc Status",
       "Tables Tab",
+      "Concall Key Insights",
       "Source",
     ];
 
@@ -1411,6 +1617,8 @@ async function appendDocumentRows(
         docText: string;
         status: string;
         tables: ExtractedTable[];
+        concallInsights?: string;
+        concallInsightRows?: ConcallInsightRow[];
         convertedFileId?: string;
       } | null;
       createdDocUrl: string;
@@ -1507,7 +1715,8 @@ async function appendDocumentRows(
           doc,
           tablesAvail,
           usedTabTitles,
-          extractedText
+          extractedText,
+          p.extracted?.concallInsightRows ?? []
         );
         tabsCreated += result.tabsCreated;
         if (result.tabTitles.length > 0) {
@@ -1548,6 +1757,9 @@ async function appendDocumentRows(
         p.createdDocUrl,
         p.createdDocStatus,
         tablesTabLabel,
+        doc.category === "concall"
+          ? toSheetContent(p.extracted?.concallInsights ?? "")
+          : "",
         doc.source ? String(doc.source).toUpperCase() : "",
       ]);
 
