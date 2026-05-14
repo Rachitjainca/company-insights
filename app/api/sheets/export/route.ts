@@ -172,7 +172,8 @@ interface CreateGoogleDocResult {
 async function attemptCreateGoogleDoc(
   accessToken: string,
   title: string,
-  content: string
+  content: string,
+  contentType: string = "text/plain; charset=UTF-8"
 ): Promise<CreateGoogleDocResult> {
   try {
     const boundary = `cgi-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -186,7 +187,7 @@ async function attemptCreateGoogleDoc(
       `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
       `${JSON.stringify(metadata)}\r\n` +
       `--${boundary}\r\n` +
-      `Content-Type: text/plain; charset=UTF-8\r\n\r\n` +
+      `Content-Type: ${contentType}\r\n\r\n` +
       `${content}\r\n` +
       `--${boundary}--`;
 
@@ -237,7 +238,12 @@ async function createGoogleDoc(
 ): Promise<{ url: string | null; status: string }> {
   let last: CreateGoogleDocResult = { url: null, status: "unknown" };
   for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const result = await attemptCreateGoogleDoc(accessToken, title, content);
+    const result = await attemptCreateGoogleDoc(
+      accessToken,
+      title,
+      content,
+      "text/plain; charset=UTF-8"
+    );
     if (result.url) return result;
     last = result;
     // Only retry on transient errors (5xx / network exception).
@@ -247,6 +253,89 @@ async function createGoogleDoc(
     if (!transient) break;
   }
   return last;
+}
+
+async function createGoogleDocFromHtml(
+  accessToken: string,
+  title: string,
+  html: string
+): Promise<{ url: string | null; status: string }> {
+  let last: CreateGoogleDocResult = { url: null, status: "unknown" };
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const result = await attemptCreateGoogleDoc(
+      accessToken,
+      title,
+      html,
+      "text/html; charset=UTF-8"
+    );
+    if (result.url) return result;
+    last = result;
+    // Only retry on transient errors (5xx / network exception).
+    const transient =
+      result.status === "exception" ||
+      /^http-5\d\d$/.test(result.status);
+    if (!transient) break;
+  }
+  return last;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildFinancialTablesOnlyHtml(
+  headerText: string,
+  tables: ExtractedTable[]
+): string {
+  const tableBlocks = tables
+    .slice(0, 20)
+    .map((t, idx) => {
+      const rows = t.rows
+        .slice(0, 120)
+        .map((row, rowIndex) => {
+          const tag = rowIndex === 0 ? "th" : "td";
+          const cells = row
+            .slice(0, 20)
+            .map((cell) => `<${tag}>${escapeHtml(String(cell ?? ""))}</${tag}>`)
+            .join("");
+          return `<tr>${cells}</tr>`;
+        })
+        .join("");
+
+      return [
+        `<h3>${idx + 1}. ${escapeHtml(t.caption || `Table ${idx + 1}`)}</h3>`,
+        `<table>${rows}</table>`,
+      ].join("\n");
+    })
+    .join("\n");
+
+  const headerLines = headerText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => `<p>${escapeHtml(line)}</p>`)
+    .join("\n");
+
+  return [
+    "<!doctype html>",
+    '<html><head><meta charset="utf-8" />',
+    "<style>",
+    "body{font-family:Arial,sans-serif;font-size:11pt;line-height:1.4;color:#111}",
+    "h2,h3{margin:14px 0 6px}",
+    "table{border-collapse:collapse;width:100%;margin:8px 0 16px}",
+    "th,td{border:1px solid #cfd6de;padding:4px 6px;vertical-align:top}",
+    "th{background:#eef3f8;font-weight:700}",
+    "</style></head><body>",
+    "<h2>Financial Statement Tables</h2>",
+    headerLines,
+    tableBlocks || "<p>No financial tables were extracted.</p>",
+    "</body></html>",
+  ].join("\n");
 }
 
 /**
@@ -1637,25 +1726,52 @@ async function appendDocumentRows(
 
       if (createGoogleDocs && extracted) {
         const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
-        if (extracted.convertedFileId) {
-          const renamed = await renameDriveFile(
-            accessToken,
-            extracted.convertedFileId,
-            safeTitle
+        let createdFinancialOnly = false;
+
+        // For quarterly-result exports, prefer a financial-only Google Doc built
+        // from extracted table grids. This avoids carrying unrelated pages from
+        // the original converted PDF Doc.
+        if (doc.category === "quarterly-results" && extracted.tables.length > 0) {
+          const html = buildFinancialTablesOnlyHtml(
+            buildDocHeader(data, doc),
+            extracted.tables
           );
-          createdDocUrl = `https://docs.google.com/document/d/${extracted.convertedFileId}/edit`;
-          createdDocStatus = renamed
-            ? `${extracted.status}+native-tables`
-            : `${extracted.status}+native-tables (rename-failed)`;
-          docCreated = true;
-        } else {
-          const made = await createGoogleDoc(accessToken, safeTitle, extracted.docText);
-          if (made.url) {
-            createdDocUrl = made.url;
-            createdDocStatus = extracted.status;
+          const madeTables = await createGoogleDocFromHtml(accessToken, safeTitle, html);
+          if (madeTables.url) {
+            createdDocUrl = madeTables.url;
+            createdDocStatus = `${extracted.status}+financial-tables-only`;
+            docCreated = true;
+            createdFinancialOnly = true;
+
+            // A helper converted file may exist from fallback extraction paths.
+            // Once we create the financial-only Doc, clean up the helper copy.
+            if (extracted.convertedFileId) {
+              await deleteDriveFile(accessToken, extracted.convertedFileId);
+            }
+          }
+        }
+
+        if (!createdFinancialOnly) {
+          if (extracted.convertedFileId) {
+            const renamed = await renameDriveFile(
+              accessToken,
+              extracted.convertedFileId,
+              safeTitle
+            );
+            createdDocUrl = `https://docs.google.com/document/d/${extracted.convertedFileId}/edit`;
+            createdDocStatus = renamed
+              ? `${extracted.status}+native-tables`
+              : `${extracted.status}+native-tables (rename-failed)`;
             docCreated = true;
           } else {
-            createdDocStatus = `doc-create-failed-${made.status}`;
+            const made = await createGoogleDoc(accessToken, safeTitle, extracted.docText);
+            if (made.url) {
+              createdDocUrl = made.url;
+              createdDocStatus = extracted.status;
+              docCreated = true;
+            } else {
+              createdDocStatus = `doc-create-failed-${made.status}`;
+            }
           }
         }
       } else if (extracted?.convertedFileId && !createGoogleDocs) {
