@@ -330,7 +330,9 @@ export default function CompanyDocuments({
 }: CompanyDocumentsProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
-  const [sourceFilter, setSourceFilter] = useState<"all" | IRSource>("all");
+  const [sourceFilter, setSourceFilter] = useState<"all" | IRSource | "xbrl">(
+    "all"
+  );
 
   const fetchDocs = useCallback(() => {
     let cancelled = false;
@@ -439,6 +441,7 @@ export default function CompanyDocuments({
   // Filter docs by source when a filter is active
   function filterBySource(docs: IRDocument[]): IRDocument[] {
     if (sourceFilter === "all") return docs;
+    if (sourceFilter === "xbrl") return docs.filter((d) => !!d.xbrlUrl);
     return docs.filter((d) => d.source === sourceFilter);
   }
 
@@ -467,17 +470,31 @@ export default function CompanyDocuments({
           {/* Source toggle */}
           {(nseOk || bseOk) && (
             <div className="flex items-center rounded-xl border border-gray-200 bg-gray-50 p-0.5 gap-0.5 text-xs font-semibold">
-              {(["all", "nse", "bse"] as const).map((f) => (
+              {(
+                [
+                  { v: "all", label: "All" },
+                  { v: "nse", label: "NSE" },
+                  { v: "bse", label: "BSE" },
+                  { v: "xbrl", label: "XBRL" },
+                ] as const
+              ).map(({ v, label }) => (
                 <button
-                  key={f}
-                  onClick={() => setSourceFilter(f)}
+                  key={v}
+                  onClick={() => setSourceFilter(v)}
                   className={`px-2.5 py-1 rounded-lg transition-colors ${
-                    sourceFilter === f
+                    sourceFilter === v
                       ? "bg-white shadow-sm text-gray-900 border border-gray-200"
                       : "text-gray-500 hover:text-gray-700"
                   }`}
+                  title={
+                    v === "xbrl"
+                      ? "Show only filings with machine-readable XBRL data"
+                      : v === "all"
+                        ? "Show every filing"
+                        : `Show only filings sourced from ${label}`
+                  }
                 >
-                  {f === "all" ? "All" : f.toUpperCase()}
+                  {label}
                 </button>
               ))}
             </div>

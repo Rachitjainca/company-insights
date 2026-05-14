@@ -1,17 +1,19 @@
 /**
- * PDF table extraction using positional text clustering.
+ * PDF table extraction tuned for Indian listed-company financial filings
+ * (Reg-33 results, balance sheets, cash-flow statements).
  *
  * Approach:
- * 1. Use `unpdf` (serverless-friendly pdfjs build) to fetch text items per
- *    page along with their (x, y, width) positions.
- * 2. Group items into rows by Y-coordinate (within a tolerance).
- * 3. Detect column boundaries by clustering item start-X across rows.
- * 4. Emit a 2-D grid per page, then keep "table-like" / financial-looking
- *    blocks as `ExtractedTable` entries.
- *
- * This is intentionally heuristic — financial PDFs vary widely. We tune the
- * thresholds to favour recall on tabular regions and filter strict financial
- * keywords downstream.
+ * 1. Use `unpdf` to fetch positioned text items per page.
+ * 2. Group items into rows by Y-coordinate.
+ * 3. Detect column boundaries:
+ *      - text columns: cluster left-edge X
+ *      - numeric columns: cluster *right-edge* X (since numbers are
+ *        right-aligned in financial statements)
+ *      - merge both into a single ordered column list.
+ * 4. Snap each item to a column by edge proximity.
+ * 5. Score each detected table block by a financial-statement signal
+ *    (Reg-33 keywords, presence of "particulars" header, "quarter ended"
+ *    headers, density of numeric cells). Rank, return only top blocks.
  */
 
 import { extractText, getDocumentProxy } from "unpdf";
@@ -23,18 +25,24 @@ export interface ExtractedTable {
   page?: number;
   /** How the table was extracted (for status/debugging). */
   source?: "pdf-positional" | "html";
+  /** Heuristic financial-quality score (higher = more confident). */
+  score?: number;
 }
 
 interface TextItem {
   str: string;
-  x: number;
+  x: number; // left edge
   y: number;
   width: number;
   height: number;
 }
 
 const FIN_KEYWORD_RE =
-  /revenue|income|expense|ebitda|ebit\b|pbt|pat|profit|loss|eps|margin|cash\s*flow|asset|liabilit|debt|borrow|capex|operat(?:ing|ional)|volume|utili[sz]ation|subscriber|arpu|aov|order|guidance|roe|roa|roce|gnpa|nnpa|aum|gmv|tpv|merchant|loan|disburs|interest|deposit|reserves|equity|share\s*capital|tax|depreciation|amortis|amortiz/i;
+  /revenue|income|expense|ebitda|ebit\b|pbt|pat|profit|loss|eps|earning|margin|cash\s*flow|asset|liabilit|debt|borrow|capex|operat(?:ing|ional)|volume|utili[sz]ation|subscriber|arpu|aov|order|guidance|roe|roa|roce|gnpa|nnpa|aum|gmv|tpv|merchant|loan|disburs|interest|deposit|reserves|equity|share\s*capital|tax|depreciation|amortis|amortiz|particulars|quarter\s*ended|year\s*ended|standalone|consolidated|statement\s*of/i;
+
+/** Strong Reg-33 / IndAS financial-statement signals (used for scoring). */
+const REG33_SIGNAL_RE =
+  /particulars|quarter\s*ended|year\s*ended|statement\s*of\s*(standalone|consolidated|profit|financial)|standalone\s+financial\s+results|consolidated\s+financial\s+results|balance\s*sheet|cash\s*flow\s*statement|earnings\s*per\s*equity\s*share/i;
 
 const NUMERIC_CELL_RE = /^[\(\-]?\s*[\d][\d,]*(?:\.\d+)?\s*%?\s*\)?$/;
 
@@ -51,7 +59,6 @@ interface PdfTextItemRaw {
 
 interface PdfPageProxy {
   getTextContent: () => Promise<{ items: PdfTextItemRaw[] }>;
-  getViewport?: (params: { scale: number }) => { height: number; width: number };
 }
 
 interface PdfDocumentProxy {
@@ -63,7 +70,6 @@ async function loadPositionedItems(
   pdfBytes: Uint8Array,
   maxPages = 30
 ): Promise<TextItem[][]> {
-  // `getDocumentProxy` works in node serverless contexts (no DOM/canvas).
   const pdf = (await getDocumentProxy(pdfBytes)) as unknown as PdfDocumentProxy;
   const pageCount = Math.min(pdf.numPages, maxPages);
   const out: TextItem[][] = [];
@@ -75,7 +81,6 @@ async function loadPositionedItems(
     for (const it of tc.items) {
       const str = (it.str ?? "").replace(/\s+/g, " ");
       if (!str.trim()) continue;
-      // pdfjs transform = [a,b,c,d,e,f] where (e,f) ~= (x,y); y origin is bottom-left.
       const tr = it.transform ?? [1, 0, 0, 1, 0, 0];
       const x = tr[4] ?? 0;
       const y = tr[5] ?? 0;
@@ -93,16 +98,14 @@ async function loadPositionedItems(
 /*  Row + column clustering                                                  */
 /* ------------------------------------------------------------------------- */
 
-/** Group text items into rows by Y (PDF coords: larger y = higher on page). */
 function groupIntoRows(items: TextItem[]): TextItem[][] {
   if (items.length === 0) return [];
   const sorted = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
 
-  // Tolerance ~ 0.6 * median height
   const heights = sorted.map((i) => i.height || 10).filter((h) => h > 0);
   heights.sort((a, b) => a - b);
   const medianHeight = heights[Math.floor(heights.length / 2)] || 10;
-  const yTol = Math.max(2, medianHeight * 0.6);
+  const yTol = Math.max(2, medianHeight * 0.55);
 
   const rows: TextItem[][] = [];
   let current: TextItem[] = [];
@@ -120,18 +123,16 @@ function groupIntoRows(items: TextItem[]): TextItem[][] {
   return rows;
 }
 
-/** Merge adjacent items inside a row that are visually contiguous (same word). */
 function mergeRowItems(row: TextItem[]): TextItem[] {
   if (row.length === 0) return row;
   const merged: TextItem[] = [];
-  let cur = { ...row[0] };
+  let cur: TextItem = { ...row[0] };
   for (let i = 1; i < row.length; i += 1) {
     const next = row[i];
     const gap = next.x - (cur.x + cur.width);
-    // If gap is < 0.4 * height treat as same logical token (e.g. "1," + "234.56")
-    const tol = (cur.height || 10) * 0.4;
+    const tol = (cur.height || 10) * 0.45;
     if (gap < tol) {
-      cur.str = `${cur.str}${gap > 0 ? "" : ""}${next.str}`;
+      cur.str = `${cur.str}${next.str}`;
       cur.width = next.x + next.width - cur.x;
     } else {
       merged.push(cur);
@@ -142,56 +143,104 @@ function mergeRowItems(row: TextItem[]): TextItem[] {
   return merged;
 }
 
-/**
- * Detect column boundaries from a set of rows by clustering item start-X.
- * Returns the X cut-points (sorted ascending).
- */
-function detectColumns(rows: TextItem[][]): number[] {
-  const xs: number[] = [];
-  for (const row of rows) for (const it of row) xs.push(it.x);
-  if (xs.length < 4) return [];
-  xs.sort((a, b) => a - b);
+interface ColumnDef {
+  /** Anchor X (right edge for numeric, left edge for text). */
+  anchor: number;
+  /** Whether this column is right-aligned (numeric) or left-aligned (text). */
+  align: "left" | "right";
+  count: number;
+}
 
-  // Bin into clusters with width ~ tolerance
-  const tol = 8; // points
-  const clusters: { center: number; count: number }[] = [];
-  for (const x of xs) {
-    const last = clusters[clusters.length - 1];
+function clusterPoints(
+  sortedPoints: number[],
+  tol: number
+): { center: number; count: number }[] {
+  if (sortedPoints.length === 0) return [];
+  const out: { center: number; count: number }[] = [];
+  for (const x of sortedPoints) {
+    const last = out[out.length - 1];
     if (last && Math.abs(x - last.center) <= tol) {
       last.center = (last.center * last.count + x) / (last.count + 1);
       last.count += 1;
     } else {
-      clusters.push({ center: x, count: 1 });
+      out.push({ center: x, count: 1 });
     }
   }
-  // Keep clusters that appear in a meaningful fraction of rows
-  const minCount = Math.max(2, Math.floor(rows.length * 0.25));
-  const significant = clusters.filter((c) => c.count >= minCount);
-  return significant.map((c) => c.center).sort((a, b) => a - b);
+  return out;
 }
 
-function assignToColumns(row: TextItem[], cols: number[]): string[] {
+/**
+ * Detect column boundaries by clustering both left-edges (text columns) and
+ * right-edges (numeric columns) of items across rows.
+ */
+function detectColumns(rows: TextItem[][]): ColumnDef[] {
+  const lefts: number[] = [];
+  const rightsNum: number[] = [];
+  for (const row of rows) {
+    for (const it of row) {
+      lefts.push(it.x);
+      if (NUMERIC_CELL_RE.test(it.str.trim())) {
+        rightsNum.push(it.x + it.width);
+      }
+    }
+  }
+  if (lefts.length < 6) return [];
+
+  const tol = 8; // pts
+  const minCount = Math.max(2, Math.floor(rows.length * 0.25));
+
+  const leftClusters = clusterPoints(
+    lefts.slice().sort((a, b) => a - b),
+    tol
+  );
+  const rightClusters = clusterPoints(
+    rightsNum.slice().sort((a, b) => a - b),
+    tol
+  );
+
+  const cols: ColumnDef[] = [];
+  // Numeric (right-aligned) columns first — these are the most reliable
+  for (const c of rightClusters) {
+    if (c.count >= minCount) {
+      cols.push({ anchor: c.center, align: "right", count: c.count });
+    }
+  }
+  // Then add left-edge text columns that don't collide
+  for (const c of leftClusters) {
+    if (c.count >= minCount) {
+      if (cols.some((x) => Math.abs(x.anchor - c.center) <= tol * 1.5)) continue;
+      cols.push({ anchor: c.center, align: "left", count: c.count });
+    }
+  }
+  cols.sort((a, b) => a.anchor - b.anchor);
+  return cols;
+}
+
+function assignToColumns(row: TextItem[], cols: ColumnDef[]): string[] {
   if (cols.length === 0) return [row.map((i) => i.str).join(" ").trim()];
   const cells: string[] = new Array(cols.length).fill("");
   for (const it of row) {
-    // Pick the column whose start-X is closest *and* not greater than item start-X.
-    let best = 0;
+    const right = it.x + it.width;
+    const isNum = NUMERIC_CELL_RE.test(it.str.trim());
+    let best = -1;
     let bestDist = Infinity;
     for (let i = 0; i < cols.length; i += 1) {
-      const d = it.x - cols[i];
-      if (d < -10) continue; // item is to the left of this col
+      const c = cols[i];
+      const itemAnchor = c.align === "right" || isNum ? right : it.x;
+      const d = Math.abs(itemAnchor - c.anchor);
       if (d < bestDist) {
         bestDist = d;
         best = i;
       }
     }
+    if (best < 0) best = 0;
     cells[best] = cells[best] ? `${cells[best]} ${it.str}` : it.str;
   }
   return cells.map((c) => c.trim());
 }
 
 /* ------------------------------------------------------------------------- */
-/*  Table block detection                                                    */
+/*  Table block detection + scoring                                          */
 /* ------------------------------------------------------------------------- */
 
 function rowIsNumeric(cells: string[]): boolean {
@@ -215,26 +264,41 @@ function rowIsHeaderLike(cells: string[]): boolean {
   return textCells >= 2;
 }
 
-function tableBlockLooksFinancial(rows: string[][]): boolean {
-  if (rows.length < 3) return false;
+function scoreTable(rows: string[][]): number {
+  if (rows.length < 3) return 0;
   const flat = rows.flat().filter(Boolean).join(" ");
-  if (FIN_KEYWORD_RE.test(flat)) return true;
-  // Or ≥40% numeric across all cells
-  let n = 0,
-    t = 0;
-  for (const r of rows) for (const c of r) {
-    if (!c) continue;
-    t += 1;
-    if (NUMERIC_CELL_RE.test(c.trim())) n += 1;
+  let score = 0;
+  if (REG33_SIGNAL_RE.test(flat)) score += 50;
+  const finMatches = flat.match(FIN_KEYWORD_RE);
+  if (finMatches) score += Math.min(30, finMatches.length * 4);
+  let n = 0;
+  let t = 0;
+  for (const r of rows)
+    for (const c of r) {
+      if (!c) continue;
+      t += 1;
+      if (NUMERIC_CELL_RE.test(c.trim())) n += 1;
+    }
+  if (t >= 12) {
+    const density = n / t;
+    score += Math.round(density * 30);
   }
-  return t >= 12 && n / t >= 0.4;
+  const maxCols = rows.reduce((m, r) => Math.max(m, r.length), 0);
+  if (maxCols >= 3) score += 10;
+  if (maxCols >= 5) score += 10;
+  if (rows.length < 5) score -= 10;
+  return score;
 }
 
 function captionFromRows(rows: string[][], pageNum: number, idx: number): string {
   for (const r of rows) {
+    const text = r.filter(Boolean).join(" ").trim();
+    if (text && REG33_SIGNAL_RE.test(text)) return text.slice(0, 140);
+  }
+  for (const r of rows) {
     const text = r.filter(Boolean).join(" · ").trim();
     if (text && /[a-z]/i.test(text) && !rowIsNumeric(r)) {
-      return text.slice(0, 120);
+      return text.slice(0, 140);
     }
   }
   return `Page ${pageNum} · Table ${idx + 1}`;
@@ -250,24 +314,13 @@ function normalizeWidth(rows: string[][]): string[][] {
   });
 }
 
-/**
- * Detect contiguous "table" runs in a list of grid-rows on a page.
- * A run is a sequence of rows where ≥half of consecutive rows look numeric
- * (or share the same column count with non-trivial content).
- */
 function detectTableRuns(grid: string[][]): { start: number; end: number }[] {
   const runs: { start: number; end: number }[] = [];
   let i = 0;
   while (i < grid.length) {
     if (rowIsNumeric(grid[i])) {
-      // Walk forward including up to 2 surrounding header/text rows.
       let start = i;
-      // Include header rows above
-      while (
-        start > 0 &&
-        i - start < 4 &&
-        rowIsHeaderLike(grid[start - 1])
-      ) {
+      while (start > 0 && i - start < 5 && rowIsHeaderLike(grid[start - 1])) {
         start -= 1;
       }
       let end = i;
@@ -292,31 +345,53 @@ function detectTableRuns(grid: string[][]): { start: number; end: number }[] {
   return runs;
 }
 
+/**
+ * Merge consecutive-page tables that share the same column structure
+ * (financial statements often spill across pages with repeating headers).
+ */
+function mergeContinuationTables(tables: ExtractedTable[]): ExtractedTable[] {
+  if (tables.length <= 1) return tables;
+  const merged: ExtractedTable[] = [];
+  for (const t of tables) {
+    const last = merged[merged.length - 1];
+    if (
+      last &&
+      last.page !== undefined &&
+      t.page !== undefined &&
+      t.page === last.page + 1 &&
+      last.rows[0]?.length === t.rows[0]?.length &&
+      (last.rows[0]?.length ?? 0) >= 3
+    ) {
+      const firstRow = t.rows[0]?.join(" ").toLowerCase() ?? "";
+      const lastFirstRow = last.rows[0]?.join(" ").toLowerCase() ?? "";
+      const startIdx = firstRow && firstRow === lastFirstRow ? 1 : 0;
+      last.rows.push(...t.rows.slice(startIdx));
+      last.score = Math.max(last.score ?? 0, t.score ?? 0) + 5;
+      continue;
+    }
+    merged.push({ ...t, rows: [...t.rows] });
+  }
+  return merged;
+}
+
 /* ------------------------------------------------------------------------- */
 /*  Public API                                                               */
 /* ------------------------------------------------------------------------- */
 
 export interface PdfTableExtractionResult {
   tables: ExtractedTable[];
-  /** Concatenated text fallback (rows joined with spaces). */
   text: string;
-  /** Total pages parsed. */
   pages: number;
   status: "ok" | "no-tables" | "empty" | "error";
 }
 
-/**
- * Extract tables from a PDF byte buffer using positional clustering.
- * Returns financial-looking tables only; non-financial tables are filtered out.
- */
 export async function extractTablesFromPdf(
   pdfBytes: Uint8Array,
-  opts: { maxPages?: number; financialOnly?: boolean } = {}
+  opts: { maxPages?: number; financialOnly?: boolean; maxTables?: number } = {}
 ): Promise<PdfTableExtractionResult> {
-  const { maxPages = 30, financialOnly = true } = opts;
+  const { maxPages = 30, financialOnly = true, maxTables = 8 } = opts;
 
   try {
-    // Quick text fallback (used when no tables are found)
     let textFallback = "";
     try {
       const t = await extractText(pdfBytes, { mergePages: true });
@@ -328,7 +403,7 @@ export async function extractTablesFromPdf(
     }
 
     const pages = await loadPositionedItems(pdfBytes, maxPages);
-    const tables: ExtractedTable[] = [];
+    let tables: ExtractedTable[] = [];
 
     pages.forEach((items, idx) => {
       if (items.length === 0) return;
@@ -336,21 +411,27 @@ export async function extractTablesFromPdf(
       const rawRows = groupIntoRows(items).map(mergeRowItems);
       if (rawRows.length === 0) return;
       const cols = detectColumns(rawRows);
-      // Build grid of cells
       const grid = rawRows.map((r) => assignToColumns(r, cols));
       const runs = detectTableRuns(grid);
       runs.forEach((run, i) => {
         const block = grid.slice(run.start, run.end + 1);
-        if (financialOnly && !tableBlockLooksFinancial(block)) return;
         const norm = normalizeWidth(block);
+        const score = scoreTable(norm);
+        if (financialOnly && score < 30) return;
         tables.push({
           rows: norm,
           caption: captionFromRows(norm, pageNum, i),
           page: pageNum,
           source: "pdf-positional",
+          score,
         });
       });
     });
+
+    tables = mergeContinuationTables(tables);
+    tables.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    tables = tables.slice(0, maxTables);
+    tables.sort((a, b) => (a.page ?? 0) - (b.page ?? 0));
 
     if (tables.length === 0) {
       return {

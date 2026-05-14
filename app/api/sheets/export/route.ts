@@ -437,7 +437,7 @@ async function addSheetTab(
   accessToken: string,
   spreadsheetId: string,
   title: string
-): Promise<string | null> {
+): Promise<{ title: string; sheetId: number } | null> {
   try {
     const res = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
@@ -459,10 +459,97 @@ async function addSheetTab(
       );
       return null;
     }
-    return title;
+    const body = (await res.json().catch(() => null)) as {
+      replies?: Array<{ addSheet?: { properties?: { sheetId?: number; title?: string } } }>;
+    } | null;
+    const props = body?.replies?.[0]?.addSheet?.properties;
+    return {
+      title: props?.title ?? title,
+      sheetId: props?.sheetId ?? 0,
+    };
   } catch (error) {
     console.error("addSheetTab error:", error);
     return null;
+  }
+}
+
+/**
+ * Apply nice formatting to a freshly-written financial table tab:
+ *  - bold header row
+ *  - frozen first row + first column
+ *  - auto-resize all columns
+ *  - thin border under header
+ */
+async function formatFinancialTab(
+  accessToken: string,
+  spreadsheetId: string,
+  sheetId: number,
+  headerRowIndex: number,
+  numColumns: number
+): Promise<void> {
+  if (numColumns < 1) return;
+  try {
+    const requests: unknown[] = [
+      // Freeze top header row + first label column
+      {
+        updateSheetProperties: {
+          properties: {
+            sheetId,
+            gridProperties: { frozenRowCount: 1, frozenColumnCount: 1 },
+          },
+          fields: "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+        },
+      },
+      // Bold the header row
+      {
+        repeatCell: {
+          range: {
+            sheetId,
+            startRowIndex: headerRowIndex,
+            endRowIndex: headerRowIndex + 1,
+            startColumnIndex: 0,
+            endColumnIndex: numColumns,
+          },
+          cell: {
+            userEnteredFormat: {
+              textFormat: { bold: true },
+              backgroundColor: { red: 0.95, green: 0.96, blue: 0.99 },
+            },
+          },
+          fields: "userEnteredFormat(textFormat,backgroundColor)",
+        },
+      },
+      // Auto-resize all columns
+      {
+        autoResizeDimensions: {
+          dimensions: {
+            sheetId,
+            dimension: "COLUMNS",
+            startIndex: 0,
+            endIndex: numColumns,
+          },
+        },
+      },
+    ];
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ requests }),
+      }
+    );
+    if (!res.ok) {
+      console.warn(
+        `formatFinancialTab non-fatal failure (HTTP ${res.status}):`,
+        (await res.text().catch(() => "")).slice(0, 300)
+      );
+    }
+  } catch (error) {
+    console.warn("formatFinancialTab error (non-fatal):", error);
   }
 }
 
@@ -555,27 +642,51 @@ async function writeTablesAsSheetTabs(
     if (suffix > 50) break;
   }
 
-  const tabTitle = await addSheetTab(accessToken, spreadsheetId, title);
-  if (!tabTitle) return { tabsCreated: 0, tabTitles: [] };
-  usedTabTitles.add(tabTitle.toLowerCase());
+  const tab = await addSheetTab(accessToken, spreadsheetId, title);
+  if (!tab) return { tabsCreated: 0, tabTitles: [] };
+  usedTabTitles.add(tab.title.toLowerCase());
 
-  // Build a single values payload: header block, then each table with caption row.
+  // Build a single values payload: a context block, then each financial
+  // table with a caption row above it. The first table's first row becomes
+  // the "header" we bold + freeze for analysts.
   const values: (string | number | null)[][] = [];
-  values.push([`${doc.title}`]);
+  values.push([doc.title]);
   values.push([`Source: ${doc.url}`]);
   if (periodPart) values.push([`Period: ${periodPart}`]);
+  values.push([`Extracted: ${tables.length} financial table${tables.length !== 1 ? "s" : ""}`]);
   values.push([]);
 
+  // Track which row is the first detected table's header (to bold + freeze).
+  let headerRowIndex = -1;
+  let headerColCount = 0;
+
   tables.forEach((t, i) => {
-    values.push([`Table ${i + 1}: ${t.caption}`]);
+    values.push([`${i + 1}. ${t.caption}`]);
+    if (i === 0 && t.rows.length > 0) {
+      headerRowIndex = values.length; // 0-based — this is the row about to be pushed
+      headerColCount = t.rows[0].length;
+    }
     for (const row of t.rows) {
       values.push(row.map((c) => coerceCell(c)));
     }
     values.push([]);
   });
 
-  const ok = await appendValuesToTab(accessToken, spreadsheetId, tabTitle, values);
-  if (ok) created.push(tabTitle);
+  const ok = await appendValuesToTab(accessToken, spreadsheetId, tab.title, values);
+  if (!ok) return { tabsCreated: 0, tabTitles: [] };
+
+  // Pretty formatting (best-effort, non-fatal).
+  if (headerRowIndex >= 0 && headerColCount > 0) {
+    await formatFinancialTab(
+      accessToken,
+      spreadsheetId,
+      tab.sheetId,
+      headerRowIndex,
+      Math.max(headerColCount, 4)
+    );
+  }
+
+  created.push(tab.title);
   return { tabsCreated: created.length, tabTitles: created };
 }
 
@@ -1498,7 +1609,7 @@ async function appendXBRLComparativeSheet(
 
   const tab = await addSheetTab(accessToken, spreadsheetId, title);
   if (!tab) return { ok: false, tabsCreated: 0, quartersIncluded: columns.length };
-  usedTabTitles.add(tab.toLowerCase());
+  usedTabTitles.add(tab.title.toLowerCase());
 
   // Optional context block above the table.
   const context: (string | number | null)[][] = [
@@ -1543,7 +1654,17 @@ async function appendXBRLComparativeSheet(
     }
   }
 
-  const ok = await appendValuesToTab(accessToken, spreadsheetId, tab, context);
+  const ok = await appendValuesToTab(accessToken, spreadsheetId, tab.title, context);
+  if (ok) {
+    // Bold + freeze the metric header row (4 rows of context above it).
+    await formatFinancialTab(
+      accessToken,
+      spreadsheetId,
+      tab.sheetId,
+      3, // headers row index (0-based: 3 context rows above)
+      headers.length
+    );
+  }
   return {
     ok,
     tabsCreated: ok ? 1 : 0,
