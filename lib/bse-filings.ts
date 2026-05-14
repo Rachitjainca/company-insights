@@ -163,7 +163,6 @@ async function fetchBSEJsonWithRetry(url: string): Promise<BSEFilingsResponse | 
       const res = await fetch(attemptUrl, {
         headers: BSE_HEADERS,
         cache: "no-store",
-        next: { revalidate: 3600 },
       });
       if (!res.ok) continue;
 
@@ -208,7 +207,9 @@ async function getBSEScripMaster(): Promise<BSEScripListItem[]> {
           Origin: "https://www.bseindia.com",
           Accept: "application/json",
         },
-        next: { revalidate: 86400 },
+        // This payload is >2MB and cannot be stored in Next's data cache.
+        // We rely on the in-process TTL cache above instead.
+        cache: "no-store",
       }
     );
     if (!res.ok) return scripMasterCache ?? [];
