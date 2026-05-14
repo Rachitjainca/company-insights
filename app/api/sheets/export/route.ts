@@ -274,31 +274,6 @@ async function renameDriveFile(
   }
 }
 
-/**
- * Export a Drive file as HTML (used to harvest table structure from a
- * Drive-converted Google Doc).
- */
-async function exportDriveFileAsHtml(
-  accessToken: string,
-  fileId: string,
-  signal?: AbortSignal
-): Promise<string | null> {
-  try {
-    const res = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/html`,
-      {
-        method: "GET",
-        headers: { Authorization: `Bearer ${accessToken}` },
-        signal,
-      }
-    );
-    if (!res.ok) return null;
-    return await res.text();
-  } catch {
-    return null;
-  }
-}
-
 // ───────────────────────────────────────────────────────────────────────────
 //  HTML table parsing — extract <table>…<tr>…<td|th> structures into 2-D
 //  string grids. Designed for the HTML produced by Google Docs export.

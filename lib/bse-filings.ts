@@ -265,7 +265,7 @@ export async function fetchBSEFilings(bseCode: string): Promise<IRDocument[]> {
 
     // Try the primary `strSearch=P` filter across all pages in parallel.
     // BSE's per-page latency is ~200-400ms; serial walking added 1-2s.
-    let rows: BSEFilingRaw[] = [];
+    const rows: BSEFilingRaw[] = [];
 
     const primaryPages = await Promise.all(
       Array.from({ length: MAX_PAGES }, (_, i) =>

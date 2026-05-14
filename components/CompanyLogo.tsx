@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { getCompanyLogoCandidates } from "@/lib/company-brand";
 
 interface CompanyLogoProps {
@@ -26,15 +26,21 @@ export default function CompanyLogo({
   className = "w-12 h-12 rounded-xl",
   fallbackInitials,
 }: CompanyLogoProps) {
-  const [candidates, setCandidates] = useState<string[]>([]);
+  const candidates = useMemo(
+    () => getCompanyLogoCandidates(symbol, name),
+    [symbol, name]
+  );
   const [idx, setIdx] = useState(0);
   const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    setCandidates(getCompanyLogoCandidates(symbol, name));
+  // Reset image cursor whenever the candidate list changes (props changed)
+  // using the "adjusting state during rendering" pattern from the React docs
+  // — avoids cascading renders triggered by useEffect setState.
+  const [prevCandidates, setPrevCandidates] = useState(candidates);
+  if (prevCandidates !== candidates) {
+    setPrevCandidates(candidates);
     setIdx(0);
     setFailed(false);
-  }, [symbol, name]);
+  }
 
   const initials = (fallbackInitials || symbol.slice(0, 2)).toUpperCase();
   const showImage = !failed && candidates.length > 0 && idx < candidates.length;
