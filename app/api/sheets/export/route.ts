@@ -1178,6 +1178,61 @@ async function deleteDriveFile(accessToken: string, fileId: string): Promise<voi
   }
 }
 
+interface DriveFileMetadata {
+  id: string;
+  mimeType?: string;
+  webViewLink?: string;
+}
+
+async function getDriveFileMetadata(
+  accessToken: string,
+  fileId: string
+): Promise<DriveFileMetadata | null> {
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,mimeType,webViewLink`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+
+    if (!res.ok) {
+      console.error(
+        `getDriveFileMetadata failed (HTTP ${res.status}):`,
+        (await res.text().catch(() => "")).slice(0, 300)
+      );
+      return null;
+    }
+
+    return (await res.json().catch(() => null)) as DriveFileMetadata | null;
+  } catch (error) {
+    console.error("getDriveFileMetadata error:", error);
+    return null;
+  }
+}
+
+function buildGoogleWorkspaceFileUrl(
+  fileId: string,
+  mimeType?: string,
+  webViewLink?: string
+): string {
+  switch (mimeType) {
+    case "application/vnd.google-apps.document":
+      return `https://docs.google.com/document/d/${fileId}/edit`;
+    case "application/vnd.google-apps.spreadsheet":
+      return `https://docs.google.com/spreadsheets/d/${fileId}/edit`;
+    case "application/vnd.google-apps.presentation":
+      return `https://docs.google.com/presentation/d/${fileId}/edit`;
+    case "application/vnd.google-apps.form":
+      return `https://docs.google.com/forms/d/${fileId}/edit`;
+    default:
+      return webViewLink || `https://drive.google.com/file/d/${fileId}/view`;
+  }
+}
+
 function shouldRetrySourceConversion(status: string): boolean {
   if (status === "invalid-url") return false;
   if (status.startsWith("source-too-large")) return false;
@@ -1905,17 +1960,48 @@ async function appendDocumentRows(
               createdDocStatus = `doc-create-failed-${made.status}`;
             }
           } else if (extracted.convertedFileId) {
-            const renamed = await renameDriveFile(
+            const metadata = await getDriveFileMetadata(
               accessToken,
-              extracted.convertedFileId,
-              safeTitle
+              extracted.convertedFileId
             );
-            const baseStatus = normalizeNativeTablesDocStatus(extracted.status);
-            createdDocUrl = `https://docs.google.com/document/d/${extracted.convertedFileId}/edit`;
-            createdDocStatus = renamed
-              ? `${baseStatus}+native-tables`
-              : `${baseStatus}+native-tables (rename-failed)`;
-            docCreated = true;
+
+            // Some source files (for example XLSX investor data packs) may not
+            // end up as Google Docs. Build the open URL from actual file type
+            // so we never emit a broken docs.google.com/document URL.
+            if (metadata?.mimeType?.startsWith("application/vnd.google-apps.")) {
+              const renamed = await renameDriveFile(
+                accessToken,
+                extracted.convertedFileId,
+                safeTitle
+              );
+              const baseStatus = normalizeNativeTablesDocStatus(extracted.status);
+              createdDocUrl = buildGoogleWorkspaceFileUrl(
+                extracted.convertedFileId,
+                metadata.mimeType,
+                metadata.webViewLink
+              );
+              const nativeSuffix =
+                metadata.mimeType === "application/vnd.google-apps.document"
+                  ? "native-tables"
+                  : "native-conversion-file";
+              createdDocStatus = renamed
+                ? `${baseStatus}+${nativeSuffix}`
+                : `${baseStatus}+${nativeSuffix} (rename-failed)`;
+              docCreated = true;
+            } else {
+              // Unusable helper file (or metadata lookup failed): cleanup and
+              // fall back to creating a plain Google Doc so users always get
+              // a valid destination link.
+              await deleteDriveFile(accessToken, extracted.convertedFileId);
+              const made = await createGoogleDoc(accessToken, safeTitle, extracted.docText);
+              if (made.url) {
+                createdDocUrl = made.url;
+                createdDocStatus = `${extracted.status}+fallback-doc`;
+                docCreated = true;
+              } else {
+                createdDocStatus = `doc-create-failed-${made.status}`;
+              }
+            }
           } else {
             const made = await createGoogleDoc(accessToken, safeTitle, extracted.docText);
             if (made.url) {
