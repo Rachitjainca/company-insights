@@ -57,9 +57,24 @@ interface AppendResult {
   docsCreated: number;
 }
 
+interface ExtractedTable {
+  /** 2-D string grid of cell values (header row first when detectable). */
+  rows: string[][];
+  /** Heuristic label so users can identify a table in the spreadsheet. */
+  caption: string;
+}
+
 interface SourceTextResult {
   extractedText: string;
   status: string;
+  /** Tables extracted from the converted-Doc HTML, if any. */
+  tables: ExtractedTable[];
+  /**
+   * Drive file ID of the converted Google Doc. When present, the caller may
+   * rename and re-use it as the final result Doc (preserves native tables)
+   * instead of creating a new plain-text Doc.
+   */
+  convertedFileId?: string;
 }
 
 /**
@@ -221,6 +236,345 @@ async function createGoogleDoc(
     if (!transient) break;
   }
   return last;
+}
+
+/**
+ * Rename a Drive file (used to repurpose a Drive-converted Doc as the final
+ * result document while preserving its native table structure).
+ */
+async function renameDriveFile(
+  accessToken: string,
+  fileId: string,
+  name: string
+): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ name }),
+      }
+    );
+    if (!res.ok) {
+      console.error(
+        `renameDriveFile failed (HTTP ${res.status}):`,
+        (await res.text().catch(() => "")).slice(0, 300)
+      );
+    }
+    return res.ok;
+  } catch (error) {
+    console.error("renameDriveFile error:", error);
+    return false;
+  }
+}
+
+/**
+ * Export a Drive file as HTML (used to harvest table structure from a
+ * Drive-converted Google Doc).
+ */
+async function exportDriveFileAsHtml(
+  accessToken: string,
+  fileId: string,
+  signal?: AbortSignal
+): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/html`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal,
+      }
+    );
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  HTML table parsing — extract <table>…<tr>…<td|th> structures into 2-D
+//  string grids. Designed for the HTML produced by Google Docs export.
+// ───────────────────────────────────────────────────────────────────────────
+
+function htmlEntitiesToText(s: string): string {
+  return s
+    .replace(/<br\s*\/?>(?=)/gi, "\n")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#(\d+);/g, (_, code) =>
+      String.fromCharCode(parseInt(code, 10))
+    );
+}
+
+function cleanCell(html: string): string {
+  // Remove tags, decode entities, collapse whitespace, trim.
+  const noTags = html.replace(/<[^>]+>/g, " ");
+  return htmlEntitiesToText(noTags)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseHtmlTables(html: string): string[][][] {
+  const tables: string[][][] = [];
+  const tableRe = /<table\b[^>]*>([\s\S]*?)<\/table>/gi;
+  const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  const cellRe = /<(t[hd])\b([^>]*)>([\s\S]*?)<\/\1>/gi;
+
+  let tableMatch: RegExpExecArray | null;
+  while ((tableMatch = tableRe.exec(html))) {
+    const tableInner = tableMatch[1];
+    const rows: string[][] = [];
+
+    let trMatch: RegExpExecArray | null;
+    trRe.lastIndex = 0;
+    while ((trMatch = trRe.exec(tableInner))) {
+      const trInner = trMatch[1];
+      const cells: string[] = [];
+      let cellMatch: RegExpExecArray | null;
+      cellRe.lastIndex = 0;
+      while ((cellMatch = cellRe.exec(trInner))) {
+        const attrs = cellMatch[2];
+        const inner = cellMatch[3];
+        const text = cleanCell(inner);
+        const colspanMatch = /colspan\s*=\s*"?(\d+)"?/i.exec(attrs);
+        const colspan = colspanMatch
+          ? Math.min(parseInt(colspanMatch[1], 10) || 1, 8)
+          : 1;
+        cells.push(text);
+        // Pad colspans with empties so columns line up.
+        for (let i = 1; i < colspan; i += 1) cells.push("");
+      }
+      if (cells.length > 0) rows.push(cells);
+    }
+    if (rows.length > 0) tables.push(rows);
+  }
+
+  return tables;
+}
+
+function tableLooksFinancial(rows: string[][]): boolean {
+  if (rows.length < 2) return false;
+
+  // Flatten all cells to a single string and check for finance/KPI keywords.
+  const flat = rows
+    .flat()
+    .filter(Boolean)
+    .join(" ");
+  if (FINANCIAL_KPI_RE.test(flat)) return true;
+
+  // Or: the table must have at least two columns and ≥40% numeric cells.
+  let numericCount = 0;
+  let totalCells = 0;
+  for (const row of rows) {
+    for (const cell of row) {
+      if (!cell) continue;
+      totalCells += 1;
+      if (/-?\d[\d,]*(?:\.\d+)?%?/.test(cell)) numericCount += 1;
+    }
+  }
+  return totalCells >= 6 && numericCount / totalCells >= 0.4;
+}
+
+function captionForTable(rows: string[][], index: number): string {
+  // Use the first row text (truncated) as a caption when meaningful, else fallback.
+  const headerText = rows[0]?.filter(Boolean).join(" · ").slice(0, 120).trim();
+  if (headerText && /[a-z]/i.test(headerText)) {
+    return headerText;
+  }
+  return `Table ${index + 1}`;
+}
+
+function normalizeTableWidth(rows: string[][]): string[][] {
+  const width = rows.reduce((m, r) => Math.max(m, r.length), 0);
+  return rows.map((r) => {
+    if (r.length === width) return r;
+    const padded = r.slice();
+    while (padded.length < width) padded.push("");
+    return padded;
+  });
+}
+
+function extractFinancialTablesFromHtml(html: string): ExtractedTable[] {
+  const all = parseHtmlTables(html);
+  const filtered: ExtractedTable[] = [];
+  let kept = 0;
+  for (const t of all) {
+    if (!tableLooksFinancial(t)) continue;
+    const normalized = normalizeTableWidth(t);
+    filtered.push({
+      rows: normalized,
+      caption: captionForTable(normalized, kept),
+    });
+    kept += 1;
+    if (kept >= 30) break; // Safety cap.
+  }
+  return filtered;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  Sheet helpers — add a new tab and append rows for table data.
+// ───────────────────────────────────────────────────────────────────────────
+
+function sanitizeSheetTitle(input: string, fallback: string): string {
+  // Sheets disallows : \ / ? * [ ] and titles must be ≤100 chars and unique.
+  const cleaned = input.replace(/[:\\\/?*\[\]]/g, " ").replace(/\s+/g, " ").trim();
+  return (cleaned || fallback).slice(0, 90);
+}
+
+async function addSheetTab(
+  accessToken: string,
+  spreadsheetId: string,
+  title: string
+): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          requests: [{ addSheet: { properties: { title } } }],
+        }),
+      }
+    );
+    if (!res.ok) {
+      console.error(
+        `addSheetTab failed (HTTP ${res.status}):`,
+        (await res.text().catch(() => "")).slice(0, 300)
+      );
+      return null;
+    }
+    return title;
+  } catch (error) {
+    console.error("addSheetTab error:", error);
+    return null;
+  }
+}
+
+async function appendValuesToTab(
+  accessToken: string,
+  spreadsheetId: string,
+  tabTitle: string,
+  values: (string | number | null)[][]
+): Promise<boolean> {
+  try {
+    const range = `${tabTitle}!A1`;
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
+        range
+      )}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ values }),
+      }
+    );
+    if (!res.ok) {
+      console.error(
+        `appendValuesToTab failed (HTTP ${res.status}):`,
+        (await res.text().catch(() => "")).slice(0, 300)
+      );
+    }
+    return res.ok;
+  } catch (error) {
+    console.error("appendValuesToTab error:", error);
+    return false;
+  }
+}
+
+/**
+ * Convert string cells to numbers when they look numeric (so Sheets formats
+ * them as numbers, not text). Strips commas, percent signs, parentheses
+ * (treated as negatives), and currency-like prefixes.
+ */
+function coerceCell(value: string): string | number {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+
+  // Avoid coercing things like "Q1 FY24" or "2024-25"
+  if (!/^[\(\-]?\s*[\d,.]+\s*%?\s*\)?$/.test(trimmed)) return trimmed;
+
+  let s = trimmed;
+  let negative = false;
+  if (/^\(.*\)$/.test(s)) {
+    negative = true;
+    s = s.slice(1, -1);
+  }
+  s = s.replace(/[,\s]/g, "");
+  const isPct = s.endsWith("%");
+  if (isPct) s = s.slice(0, -1);
+  const num = Number(s);
+  if (!Number.isFinite(num)) return trimmed;
+  const result = negative ? -num : num;
+  return isPct ? result : result;
+}
+
+async function writeTablesAsSheetTabs(
+  accessToken: string,
+  spreadsheetId: string,
+  doc: ExportDocument,
+  tables: ExtractedTable[],
+  usedTabTitles: Set<string>
+): Promise<{ tabsCreated: number; tabTitles: string[] }> {
+  const created: string[] = [];
+  if (tables.length === 0) return { tabsCreated: 0, tabTitles: [] };
+
+  // Build a base tab title from doc context.
+  const periodPart = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" ");
+  const baseTitle = sanitizeSheetTitle(
+    [periodPart, doc.title].filter(Boolean).join(" · "),
+    "Tables"
+  );
+
+  // Single tab per document — concatenate tables with a header row separator.
+  let title = baseTitle || "Tables";
+  let suffix = 2;
+  while (usedTabTitles.has(title.toLowerCase())) {
+    const trySuffix = ` (${suffix})`;
+    title = sanitizeSheetTitle(baseTitle.slice(0, 90 - trySuffix.length) + trySuffix, "Tables");
+    suffix += 1;
+    if (suffix > 50) break;
+  }
+
+  const tabTitle = await addSheetTab(accessToken, spreadsheetId, title);
+  if (!tabTitle) return { tabsCreated: 0, tabTitles: [] };
+  usedTabTitles.add(tabTitle.toLowerCase());
+
+  // Build a single values payload: header block, then each table with caption row.
+  const values: (string | number | null)[][] = [];
+  values.push([`${doc.title}`]);
+  values.push([`Source: ${doc.url}`]);
+  if (periodPart) values.push([`Period: ${periodPart}`]);
+  values.push([]);
+
+  tables.forEach((t, i) => {
+    values.push([`Table ${i + 1}: ${t.caption}`]);
+    for (const row of t.rows) {
+      values.push(row.map((c) => coerceCell(c)));
+    }
+    values.push([]);
+  });
+
+  const ok = await appendValuesToTab(accessToken, spreadsheetId, tabTitle, values);
+  if (ok) created.push(tabTitle);
+  return { tabsCreated: created.length, tabTitles: created };
 }
 
 function normalizeWhitespace(text: string): string {
@@ -392,12 +746,13 @@ async function attemptSourceTextViaGoogleConversion(
       return {
         extractedText: "",
         status: `source-fetch-failed-${sourceRes.status}`,
+        tables: [],
       };
     }
 
     const contentLength = Number(sourceRes.headers.get("content-length") || "0");
     if (contentLength > 0 && contentLength > MAX_SOURCE_FILE_BYTES) {
-      return { extractedText: "", status: "source-too-large" };
+      return { extractedText: "", status: "source-too-large", tables: [] };
     }
 
     const sourceMimeType =
@@ -414,7 +769,7 @@ async function attemptSourceTextViaGoogleConversion(
     } else {
       const sourceBytes = new Uint8Array(await sourceRes.arrayBuffer());
       if (sourceBytes.byteLength > MAX_SOURCE_FILE_BYTES) {
-        return { extractedText: "", status: "source-too-large" };
+        return { extractedText: "", status: "source-too-large", tables: [] };
       }
       uploadBody = sourceBytes;
       uploadByteLength = sourceBytes.byteLength;
@@ -447,12 +802,13 @@ async function attemptSourceTextViaGoogleConversion(
       return {
         extractedText: "",
         status: `doc-conversion-init-failed-${initRes.status}`,
+        tables: [],
       };
     }
 
     const resumableUrl = initRes.headers.get("location");
     if (!resumableUrl) {
-      return { extractedText: "", status: "doc-conversion-session-missing" };
+      return { extractedText: "", status: "doc-conversion-session-missing", tables: [] };
     }
 
     const uploadHeaders: Record<string, string> = {
@@ -481,6 +837,7 @@ async function attemptSourceTextViaGoogleConversion(
       return {
         extractedText: "",
         status: `doc-conversion-failed-${uploadRes.status}`,
+        tables: [],
       };
     }
 
@@ -490,36 +847,59 @@ async function attemptSourceTextViaGoogleConversion(
     const fileId = uploaded?.id;
 
     if (!fileId) {
-      return { extractedText: "", status: "doc-id-missing" };
+      return { extractedText: "", status: "doc-id-missing", tables: [] };
     }
 
-    try {
-      const exportRes = await fetch(
+    // Export as plain text (for KPI text extraction) and as HTML (for tables).
+    // We deliberately KEEP the converted file so the caller can rename it and
+    // reuse it as the final result Doc — the converted Doc preserves tables
+    // natively, which a re-created text-only Doc would not.
+    const [textRes, htmlRes] = await Promise.all([
+      fetch(
         `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`,
         {
           method: "GET",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-          },
+          headers: { Authorization: `Bearer ${accessToken}` },
           signal: controller.signal,
         }
-      );
+      ),
+      fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/html`,
+        {
+          method: "GET",
+          headers: { Authorization: `Bearer ${accessToken}` },
+          signal: controller.signal,
+        }
+      ),
+    ]);
 
-      if (!exportRes.ok) {
-        return {
-          extractedText: "",
-          status: `doc-created-no-text-export-${exportRes.status}`,
-        };
-      }
-
-      const exportedText = normalizeWhitespace(await exportRes.text());
-      return {
-        extractedText: toDocText(exportedText),
-        status: exportedText ? "ok-via-doc-conversion" : "doc-created-empty-text",
-      };
-    } finally {
+    if (!textRes.ok) {
+      // Best effort: still try HTML; cleanup the file since we can't use it.
       await deleteDriveFile(accessToken, fileId);
+      return {
+        extractedText: "",
+        status: `doc-created-no-text-export-${textRes.status}`,
+        tables: [],
+      };
     }
+
+    const exportedText = normalizeWhitespace(await textRes.text());
+    let tables: ExtractedTable[] = [];
+    if (htmlRes.ok) {
+      try {
+        const html = await htmlRes.text();
+        tables = extractFinancialTablesFromHtml(html);
+      } catch (err) {
+        console.error("HTML table parse error:", err);
+      }
+    }
+
+    return {
+      extractedText: toDocText(exportedText),
+      status: exportedText ? "ok-via-doc-conversion" : "doc-created-empty-text",
+      tables,
+      convertedFileId: fileId,
+    };
   } catch (error) {
     const isAbort =
       error instanceof Error &&
@@ -528,6 +908,7 @@ async function attemptSourceTextViaGoogleConversion(
     return {
       extractedText: "",
       status: isAbort ? "doc-conversion-timeout" : "doc-conversion-error",
+      tables: [],
     };
   } finally {
     clearTimeout(timeout);
@@ -540,12 +921,13 @@ async function extractSourceTextViaGoogleConversion(
   sourceUrl: string
 ): Promise<SourceTextResult> {
   if (!/^https?:\/\//i.test(sourceUrl)) {
-    return { extractedText: "", status: "invalid-url" };
+    return { extractedText: "", status: "invalid-url", tables: [] };
   }
 
   let lastResult: SourceTextResult = {
     extractedText: "",
     status: "doc-conversion-error",
+    tables: [],
   };
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -555,7 +937,7 @@ async function extractSourceTextViaGoogleConversion(
       sourceUrl
     );
 
-    if (result.extractedText) {
+    if (result.extractedText || result.convertedFileId) {
       return result;
     }
 
@@ -572,13 +954,32 @@ async function buildGoogleDocContentForDocument(
   accessToken: string,
   data: ExportRequest,
   doc: ExportDocument
-): Promise<{ docText: string; status: string }> {
+): Promise<{
+  docText: string;
+  status: string;
+  tables: ExtractedTable[];
+  convertedFileId?: string;
+}> {
   // Prefer taxonomy-based extraction for quarterly result docs with XBRL.
   if (doc.category === "quarterly-results" && doc.xbrlUrl) {
     const metrics = await parseQuarterlyXBRL(doc.xbrlUrl, NSE_HEADERS);
     const xbrlDocText = buildXbrlFinancialDoc(data, doc, metrics);
     if (xbrlDocText) {
-      return { docText: xbrlDocText, status: "ok-xbrl-taxonomy" };
+      // Build a synthetic table from the metric/value pairs so it shows up in
+      // Sheets too, not only as text.
+      const metricRows: string[][] = [["Metric", "Value"]];
+      for (const label of ORDERED_METRICS) {
+        if (metrics[label] === undefined) continue;
+        metricRows.push([label, formatMetricValue(metrics[label])]);
+      }
+      return {
+        docText: xbrlDocText,
+        status: "ok-xbrl-taxonomy",
+        tables:
+          metricRows.length > 1
+            ? [{ rows: metricRows, caption: "XBRL taxonomy metrics" }]
+            : [],
+      };
     }
   }
 
@@ -586,6 +987,13 @@ async function buildGoogleDocContentForDocument(
   if (extracted.fullText) {
     const filtered = extractFinancialKpiText(extracted.fullText);
     if (filtered) {
+      // Direct fetch path doesn't expose tables (PDFs are binary). Still
+      // attempt Drive conversion below so we get tables for the sheet.
+      const converted = await extractSourceTextViaGoogleConversion(
+        accessToken,
+        `${data.company.symbol} - ${doc.title}`.slice(0, 120),
+        doc.url
+      );
       return {
         docText: toDocText(
           [
@@ -596,6 +1004,8 @@ async function buildGoogleDocContentForDocument(
           ].join("\n")
         ),
         status: `ok-filtered-${extracted.status}`,
+        tables: converted.tables,
+        convertedFileId: converted.convertedFileId,
       };
     }
   }
@@ -618,6 +1028,8 @@ async function buildGoogleDocContentForDocument(
           ].join("\n")
         ),
         status: `ok-filtered-${converted.status}`,
+        tables: converted.tables,
+        convertedFileId: converted.convertedFileId,
       };
     }
   }
@@ -631,18 +1043,25 @@ async function buildGoogleDocContentForDocument(
       ].join("\n")
     ),
     status: `no-financial-kpi-${converted.status || extracted.status}`,
+    tables: converted.tables,
+    convertedFileId: converted.convertedFileId,
   };
+}
+
+interface DocumentAppendResult extends AppendResult {
+  tabsCreated: number;
 }
 
 /**
  * Append IR document rows to Google Sheet (one row per document).
  * Can optionally include extracted financial/KPI content in a dedicated column.
+ * Also writes any extracted financial tables into per-document sheet tabs.
  */
 async function appendDocumentRows(
   accessToken: string,
   spreadsheetId: string,
   data: ExportRequest
-): Promise<AppendResult> {
+): Promise<DocumentAppendResult> {
   try {
     const createGoogleDocs = data.createGoogleDocs !== false;
     const includeContent = data.includeContent === true;
@@ -656,6 +1075,7 @@ async function appendDocumentRows(
       "Source URL",
       "Google Doc URL",
       "Doc Status",
+      "Tables Tab",
       "Source",
     ];
 
@@ -665,36 +1085,86 @@ async function appendDocumentRows(
 
     const rows: string[][] = [];
     let docsCreated = 0;
+    let tabsCreated = 0;
+    const usedTabTitles = new Set<string>();
 
     for (const doc of data.documents) {
       const period = [doc.fiscalYear, doc.quarter].filter(Boolean).join(" · ");
       let googleDocUrl = "";
       let docStatus = createGoogleDocs ? "doc-pending" : "doc-disabled";
       let sheetContent = "";
+      let tablesTabLabel = "";
 
       const needsExtraction = createGoogleDocs || includeContent;
 
-      let extractedContent: { docText: string; status: string } | null = null;
+      let extracted:
+        | {
+            docText: string;
+            status: string;
+            tables: ExtractedTable[];
+            convertedFileId?: string;
+          }
+        | null = null;
       if (needsExtraction) {
-        extractedContent = await buildGoogleDocContentForDocument(accessToken, data, doc);
+        extracted = await buildGoogleDocContentForDocument(accessToken, data, doc);
         if (includeContent) {
-          sheetContent = toSheetContent(extractedContent.docText);
+          sheetContent = toSheetContent(extracted.docText);
+        }
+      }
+
+      // Write extracted tables into a dedicated sheet tab so the user gets a
+      // tabular view of the financial data (not just text in a cell).
+      if (extracted && extracted.tables.length > 0) {
+        const result = await writeTablesAsSheetTabs(
+          accessToken,
+          spreadsheetId,
+          doc,
+          extracted.tables,
+          usedTabTitles
+        );
+        tabsCreated += result.tabsCreated;
+        if (result.tabTitles.length > 0) {
+          tablesTabLabel = result.tabTitles.join(", ");
         }
       }
 
       if (createGoogleDocs) {
         const safeTitle = `${data.company.symbol} - ${doc.title}`.slice(0, 120);
-        const content = extractedContent ??
+        const content =
+          extracted ??
           (await buildGoogleDocContentForDocument(accessToken, data, doc));
-        const createdDoc = await createGoogleDoc(accessToken, safeTitle, content.docText);
 
-        if (createdDoc.url) {
-          googleDocUrl = createdDoc.url;
+        // Preferred path: re-use the Drive-converted Doc as the final result
+        // so native table structure is preserved. Otherwise fall back to a
+        // plain-text Google Doc created via Drive multipart upload.
+        if (content.convertedFileId) {
+          const renamed = await renameDriveFile(
+            accessToken,
+            content.convertedFileId,
+            safeTitle
+          );
+          googleDocUrl = `https://docs.google.com/document/d/${content.convertedFileId}/edit`;
           docsCreated += 1;
-          docStatus = content.status;
+          docStatus = renamed
+            ? `${content.status}+native-tables`
+            : `${content.status}+native-tables (rename-failed)`;
         } else {
-          docStatus = `doc-create-failed-${createdDoc.status}`;
+          const createdDoc = await createGoogleDoc(
+            accessToken,
+            safeTitle,
+            content.docText
+          );
+          if (createdDoc.url) {
+            googleDocUrl = createdDoc.url;
+            docsCreated += 1;
+            docStatus = content.status;
+          } else {
+            docStatus = `doc-create-failed-${createdDoc.status}`;
+          }
         }
+      } else if (extracted?.convertedFileId) {
+        // Not creating a Doc — clean up the helper file we created.
+        await deleteDriveFile(accessToken, extracted.convertedFileId);
       }
 
       rows.push([
@@ -706,6 +1176,7 @@ async function appendDocumentRows(
         doc.url,
         googleDocUrl,
         docStatus,
+        tablesTabLabel,
         doc.source ? String(doc.source).toUpperCase() : "",
       ]);
 
@@ -732,9 +1203,11 @@ async function appendDocumentRows(
       ok: response.ok,
       rowsWritten: response.ok ? rows.length : 0,
       docsCreated: response.ok ? docsCreated : 0,
+      tabsCreated: response.ok ? tabsCreated : 0,
     };
-  } catch {
-    return { ok: false, rowsWritten: 0, docsCreated: 0 };
+  } catch (error) {
+    console.error("appendDocumentRows error:", error);
+    return { ok: false, rowsWritten: 0, docsCreated: 0, tabsCreated: 0 };
   }
 }
 
@@ -978,13 +1451,19 @@ export async function POST(request: NextRequest) {
       appendResult.docsCreated > 0
         ? ` and created ${appendResult.docsCreated} Google Doc${appendResult.docsCreated !== 1 ? "s" : ""}`
         : "";
+    const tabsCreated =
+      "tabsCreated" in appendResult ? (appendResult as DocumentAppendResult).tabsCreated : 0;
+    const tabsSuffix =
+      tabsCreated > 0
+        ? ` with ${tabsCreated} extracted-table tab${tabsCreated !== 1 ? "s" : ""}`
+        : "";
 
     return NextResponse.json(
       {
         success: true,
         spreadsheetId,
         sheetUrl,
-        message: `Successfully exported ${appendResult.rowsWritten} ${rowNoun}${appendResult.rowsWritten !== 1 ? "s" : ""} to Google Sheets${docCreatedSuffix}`,
+        message: `Successfully exported ${appendResult.rowsWritten} ${rowNoun}${appendResult.rowsWritten !== 1 ? "s" : ""} to Google Sheets${docCreatedSuffix}${tabsSuffix}`,
       },
       { status: 200 }
     );
